@@ -9,15 +9,13 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.nio.ByteBuffer
 
 class MyVpnService : VpnService() {
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private var isRunning = false
     private var vpnThread: Thread? = null
-
-    private val rateLimiter = RateLimiter(150L * 1024L)
+    private var packetForwarder: PacketForwarder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == "STOP") {
@@ -26,21 +24,26 @@ class MyVpnService : VpnService() {
         }
 
         val targetPackages = intent?.getStringArrayListExtra("TARGET_APPS") ?: arrayListOf()
-        startForegroundNotification()
-        startVpn(targetPackages)
+        val speedKb = intent?.getIntExtra("SPEED_KB", 150) ?: 150
+
+        startForegroundNotification(speedKb)
+        startVpn(targetPackages, speedKb)
         return START_STICKY
     }
 
-    private fun startVpn(targetPackages: List<String>) {
+    private fun startVpn(targetPackages: List<String>, speedKb: Int) {
         if (isRunning) return
         isRunning = true
+
+        val rateLimiter = RateLimiter(speedKb.toLong() * 1024L)
+        packetForwarder = PacketForwarder(this, rateLimiter)
 
         val builder = Builder()
             .setSession("SpeedLimiter")
             .addAddress("10.0.0.2", 32)
             .addRoute("0.0.0.0", 0)
             .addDnsServer("8.8.8.8")
-            .setMtu(1500)
+            .setMtu(1400)
 
         for (pkg in targetPackages) {
             try {
@@ -56,19 +59,8 @@ class MyVpnService : VpnService() {
             val fd = vpnInterface?.fileDescriptor ?: return@Thread
             val inputStream = FileInputStream(fd)
             val outputStream = FileOutputStream(fd)
-            val packet = ByteBuffer.allocate(32767)
-
             try {
-                while (isRunning && !Thread.currentThread().isInterrupted) {
-                    val length = inputStream.read(packet.array())
-                    if (length > 0) {
-                        rateLimiter.acquire(length)
-                        outputStream.write(packet.array(), 0, length)
-                        packet.clear()
-                    } else {
-                        Thread.sleep(10)
-                    }
-                }
+                packetForwarder?.start(inputStream, outputStream)
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -78,6 +70,7 @@ class MyVpnService : VpnService() {
 
     private fun stopVpn() {
         isRunning = false
+        packetForwarder?.stop()
         vpnThread?.interrupt()
         try {
             vpnInterface?.close()
@@ -89,7 +82,7 @@ class MyVpnService : VpnService() {
         stopSelf()
     }
 
-    private fun startForegroundNotification() {
+    private fun startForegroundNotification(speedKb: Int) {
         val channelId = "speed_limiter_channel"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
@@ -104,14 +97,14 @@ class MyVpnService : VpnService() {
         val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, channelId)
                 .setContentTitle("Speed Limiter يعمل")
-                .setContentText("تحديد السرعة إلى 150 كيلوبايت/ثانية")
+                .setContentText("تحديد السرعة إلى $speedKb كيلوبايت/ثانية")
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .build()
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
                 .setContentTitle("Speed Limiter يعمل")
-                .setContentText("تحديد السرعة إلى 150 كيلوبايت/ثانية")
+                .setContentText("تحديد السرعة إلى $speedKb كيلوبايت/ثانية")
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .build()
         }
