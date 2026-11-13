@@ -27,9 +27,15 @@ android {
     kotlinOptions {
         jvmTarget = '17'
     }
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
 }
 
 dependencies {
     implementation 'androidx.core:core-ktx:1.12.0'
     implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.github.eycorsican:go-tun2socks-android:1.16.11'
 }
