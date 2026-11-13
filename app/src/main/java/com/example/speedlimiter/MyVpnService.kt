@@ -7,6 +7,8 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import tun2socks.PacketFlow
+import tun2socks.Tun2socks
 import java.io.FileInputStream
 import java.io.FileOutputStream
 
@@ -36,14 +38,16 @@ class MyVpnService : VpnService() {
         isRunning = true
 
         val rateLimiter = RateLimiter(speedKb.toLong() * 1024L)
-        packetForwarder = PacketForwarder(this, rateLimiter)
+        packetForwarder = PacketForwarder(this, rateLimiter).apply {
+            startServer()
+        }
 
         val builder = Builder()
             .setSession("SpeedLimiter")
-            .addAddress("10.0.0.2", 32)
+            .addAddress("10.0.0.2", 24)
             .addRoute("0.0.0.0", 0)
             .addDnsServer("8.8.8.8")
-            .setMtu(1400)
+            .setMtu(1500)
 
         for (pkg in targetPackages) {
             try {
@@ -54,16 +58,32 @@ class MyVpnService : VpnService() {
         }
 
         vpnInterface = builder.establish()
+        val fd = vpnInterface?.fileDescriptor ?: return
+        val inputStream = FileInputStream(fd)
+        val outputStream = FileOutputStream(fd)
+
+        val packetFlow = PacketFlow { packet ->
+            try {
+                synchronized(outputStream) {
+                    outputStream.write(packet)
+                }
+            } catch (_: Exception) {}
+        }
+
+        Tun2socks.startSocks(packetFlow, "127.0.0.1", packetForwarder!!.localPort.toLong())
 
         vpnThread = Thread {
-            val fd = vpnInterface?.fileDescriptor ?: return@Thread
-            val inputStream = FileInputStream(fd)
-            val outputStream = FileOutputStream(fd)
+            val buffer = ByteArray(32767)
             try {
-                packetForwarder?.start(inputStream, outputStream)
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
+                while (isRunning && !Thread.currentThread().isInterrupted) {
+                    val length = inputStream.read(buffer)
+                    if (length > 0) {
+                        Tun2socks.inputPacket(buffer.copyOf(length))
+                    } else {
+                        Thread.sleep(5)
+                    }
+                }
+            } catch (_: Exception) {}
         }
         vpnThread?.start()
     }
@@ -74,9 +94,7 @@ class MyVpnService : VpnService() {
         vpnThread?.interrupt()
         try {
             vpnInterface?.close()
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        } catch (_: Exception) {}
         vpnInterface = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
