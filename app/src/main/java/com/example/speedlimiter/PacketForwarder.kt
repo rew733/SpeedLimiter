@@ -15,7 +15,7 @@ import java.util.concurrent.Executors
 class PacketForwarder(
     private val vpnService: VpnService,
     private val rateLimiter: RateLimiter,
-    private val maxSessionBytes: Long = 250L * 1024L
+    private val maxSessionBytes: Long = Long.MAX_VALUE
 ) {
     private val executor = Executors.newCachedThreadPool()
     private val tcpSessions = ConcurrentHashMap<String, TcpSession>()
@@ -26,13 +26,19 @@ class PacketForwarder(
         val packet = ByteBuffer.allocate(32767)
 
         while (running && !Thread.currentThread().isInterrupted) {
-            val length = inputStream.read(packet.array())
-            if (length > 0) {
-                val data = packet.array().copyOf(length)
-                handleOutgoingPacket(data, outputStream)
-                packet.clear()
-            } else {
-                Thread.sleep(2)
+            try {
+                val length = inputStream.read(packet.array())
+                if (length > 0) {
+                    val data = packet.array().copyOf(length)
+                    handleOutgoingPacket(data, outputStream)
+                    packet.clear()
+                } else {
+                    Thread.sleep(2)
+                }
+            } catch (_: InterruptedException) {
+                break
+            } catch (_: Exception) {
+                Thread.sleep(5)
             }
         }
     }
@@ -50,6 +56,7 @@ class PacketForwarder(
         if (version != 4) return
 
         val ipHeaderLen = (rawPacket[0].toInt() and 0x0F) * 4
+        if (rawPacket.size < ipHeaderLen) return
         val protocol = rawPacket[9].toInt() and 0xFF
         val srcIp = ByteArray(4) { rawPacket[12 + it] }
         val dstIp = ByteArray(4) { rawPacket[16 + it] }
@@ -71,6 +78,7 @@ class PacketForwarder(
         val srcPort = ((rawPacket[ipHeaderLen].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 1].toInt() and 0xFF)
         val dstPort = ((rawPacket[ipHeaderLen + 2].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 3].toInt() and 0xFF)
 
+        // حظر QUIC (UDP 443) لإجبار التطبيقات على استخدام TCP المنضبط
         if (dstPort == 443) return
 
         val payloadOffset = ipHeaderLen + 8
@@ -82,7 +90,7 @@ class PacketForwarder(
             val emptyDnsResponse = buildEmptyDnsResponse(payload)
             val ipResponse = buildUdpIpPacket(dstIp, dstPort, srcIp, srcPort, emptyDnsResponse)
             synchronized(outputStream) {
-                outputStream.write(ipResponse)
+                try { outputStream.write(ipResponse) } catch (_: Exception) {}
             }
             return
         }
@@ -108,7 +116,7 @@ class PacketForwarder(
                 }
             } catch (_: Exception) {
             } finally {
-                socket?.close()
+                try { socket?.close() } catch (_: Exception) {}
             }
         }
     }
@@ -122,6 +130,10 @@ class PacketForwarder(
                 pos++
                 break
             }
+            if ((len and 0xC0) == 0xC0) {
+                pos += 2
+                break
+            }
             pos += len + 1
         }
         if (pos + 2 > dnsPayload.size) return false
@@ -130,10 +142,28 @@ class PacketForwarder(
     }
 
     private fun buildEmptyDnsResponse(query: ByteArray): ByteArray {
-        val resp = query.copyOf()
-        if (resp.size >= 4) {
-            resp[2] = (0x81).toByte()
-            resp[3] = (0x80).toByte()
+        // استخراج رأس DNS + قسم السؤال فقط وتصفير الإجابات والملحقات
+        var pos = 12
+        while (pos < query.size) {
+            val len = query[pos].toInt() and 0xFF
+            if (len == 0) {
+                pos += 5 // null byte + QTYPE (2) + QCLASS (2)
+                break
+            }
+            if ((len and 0xC0) == 0xC0) {
+                pos += 6
+                break
+            }
+            pos += len + 1
+        }
+        val endPos = pos.coerceAtMost(query.size)
+        val resp = query.copyOf(endPos)
+        if (resp.size >= 12) {
+            resp[2] = 0x81.toByte() // QR=1, RD=1
+            resp[3] = 0x80.toByte() // RA=1, RCODE=0 (NoError)
+            resp[6] = 0; resp[7] = 0   // ANCOUNT = 0
+            resp[8] = 0; resp[9] = 0   // NSCOUNT = 0
+            resp[10] = 0; resp[11] = 0 // ARCOUNT = 0
         }
         return resp
     }
@@ -150,6 +180,7 @@ class PacketForwarder(
         val dstPort = ((rawPacket[ipHeaderLen + 2].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 3].toInt() and 0xFF)
         val seqNum = ByteBuffer.wrap(rawPacket, ipHeaderLen + 4, 4).int.toLong() and 0xFFFFFFFFL
         val tcpHeaderLen = ((rawPacket[ipHeaderLen + 12].toInt() shr 4) and 0x0F) * 4
+        if (rawPacket.size < ipHeaderLen + tcpHeaderLen) return
         val flags = rawPacket[ipHeaderLen + 13].toInt() and 0xFF
 
         val syn = (flags and 0x02) != 0
@@ -211,7 +242,8 @@ class PacketForwarder(
             try {
                 vpnService.protect(socket)
                 socket.tcpNoDelay = true
-                socket.receiveBufferSize = 4096
+                socket.soTimeout = 30000
+                socket.receiveBufferSize = 8192
                 socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 8000)
                 connected = true
 
@@ -220,16 +252,22 @@ class PacketForwarder(
                 writeToTun(synAck)
 
                 val inStream = socket.getInputStream()
-                val buffer = ByteArray(1024)
+                val buffer = ByteArray(1200)
                 while (running && connected && !socket.isClosed) {
                     val read = inStream.read(buffer)
-                    if (read == -1 || totalDownloadedBytes >= maxSessionBytes) {
+                    if (read == -1) {
                         val finPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x11, ByteArray(0))
                         mySeq = (mySeq + 1) and 0xFFFFFFFFL
                         writeToTun(finPkt)
                         break
                     }
                     if (read > 0) {
+                        if (maxSessionBytes != Long.MAX_VALUE && totalDownloadedBytes >= maxSessionBytes) {
+                            // إرسال RST لإجبار التطبيق على فتح اتصال جديد نظيف بدلاً من تعليق الصفحة
+                            val rstPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x14, ByteArray(0))
+                            writeToTun(rstPkt)
+                            break
+                        }
                         rateLimiter.acquire(read)
                         totalDownloadedBytes += read
                         val chunk = buffer.copyOf(read)
@@ -273,7 +311,9 @@ class PacketForwarder(
 
         private fun writeToTun(pkt: ByteArray) {
             synchronized(outputStream) {
-                outputStream.write(pkt)
+                try {
+                    outputStream.write(pkt)
+                } catch (_: Exception) {}
             }
         }
 
@@ -346,7 +386,7 @@ class PacketForwarder(
         buf.putInt(ack.toInt())
         buf.put(0x50.toByte())
         buf.put(flags.toByte())
-        buf.putShort(4096.toShort())
+        buf.putShort(8192.toShort())
         buf.putShort(0)
         buf.putShort(0)
         buf.put(payload)
