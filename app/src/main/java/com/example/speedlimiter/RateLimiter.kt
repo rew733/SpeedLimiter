@@ -1,33 +1,31 @@
 package com.example.speedlimiter
 
 class RateLimiter(private val bytesPerSecond: Long) {
-    private var availableTokens: Double = bytesPerSecond.toDouble()
-    private var lastRefillTimestamp: Long = System.nanoTime()
+    private var nextAllowedTimeNs: Long = System.nanoTime()
 
     @Synchronized
     fun acquire(bytes: Int) {
-        refill()
-        while (availableTokens < bytes) {
-            val deficit = bytes - availableTokens
-            val waitMillis = ((deficit / bytesPerSecond) * 1000.0).toLong().coerceAtLeast(1L)
-            try {
-                Thread.sleep(waitMillis)
-            } catch (e: InterruptedException) {
-                Thread.currentThread().interrupt()
-                return
-            }
-            refill()
-        }
-        availableTokens -= bytes
-    }
+        if (bytesPerSecond <= 0 || bytes <= 0) return
 
-    private fun refill() {
         val now = System.nanoTime()
-        val elapsedSeconds = (now - lastRefillTimestamp) / 1_000_000_000.0
-        if (elapsedSeconds > 0) {
-            availableTokens = (availableTokens + elapsedSeconds * bytesPerSecond)
-                .coerceAtMost(bytesPerSecond.toDouble())
-            lastRefillTimestamp = now
+        // منع تراكم الرصيد القديم (Zero Burst): إذا مر وقت سكون، ابدأ الحساب من اللحظة الحالية فقط
+        if (now > nextAllowedTimeNs) {
+            nextAllowedTimeNs = now
         }
+
+        val waitTimeNs = nextAllowedTimeNs - now
+        if (waitTimeNs > 0) {
+            val millis = waitTimeNs / 1_000_000L
+            val nanos = (waitTimeNs % 1_000_000L).toInt()
+            try {
+                Thread.sleep(millis, nanos)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+
+        // حساب الزمن المستحق لهذه الحزمة وإضافته للمستقبل
+        val durationNs = (bytes.toLong() * 1_000_000_000L) / bytesPerSecond
+        nextAllowedTimeNs += durationNs
     }
 }
