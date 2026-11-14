@@ -77,6 +77,16 @@ class PacketForwarder(
         if (payloadLen <= 0) return
         val payload = rawPacket.copyOfRange(payloadOffset, rawPacket.size)
 
+        // الرد الفوري بجواب فارغ على استعلامات DNS AAAA (IPv6) لإجبار التطبيق على IPv4
+        if (dstPort == 53 && isDnsAaaaQuery(payload)) {
+            val emptyDnsResponse = buildEmptyDnsResponse(payload)
+            val ipResponse = buildUdpIpPacket(dstIp, dstPort, srcIp, srcPort, emptyDnsResponse)
+            synchronized(outputStream) {
+                outputStream.write(ipResponse)
+            }
+            return
+        }
+
         executor.execute {
             var socket: DatagramSocket? = null
             try {
@@ -101,6 +111,31 @@ class PacketForwarder(
                 socket?.close()
             }
         }
+    }
+
+    private fun isDnsAaaaQuery(dnsPayload: ByteArray): Boolean {
+        if (dnsPayload.size < 16) return false
+        var pos = 12
+        while (pos < dnsPayload.size) {
+            val len = dnsPayload[pos].toInt() and 0xFF
+            if (len == 0) {
+                pos++
+                break
+            }
+            pos += len + 1
+        }
+        if (pos + 2 > dnsPayload.size) return false
+        val qType = ((dnsPayload[pos].toInt() and 0xFF) shl 8) or (dnsPayload[pos + 1].toInt() and 0xFF)
+        return qType == 28
+    }
+
+    private fun buildEmptyDnsResponse(query: ByteArray): ByteArray {
+        val resp = query.copyOf()
+        if (resp.size >= 4) {
+            resp[2] = (0x81).toByte()
+            resp[3] = (0x80).toByte()
+        }
+        return resp
     }
 
     private fun handleTcpPacket(
@@ -169,13 +204,16 @@ class PacketForwarder(
         private val socket = Socket()
         private var mySeq: Long = 10000L
         private var clientNextSeq: Long = (initialClientSeq + 1) and 0xFFFFFFFFL
+        private var totalDownloadedBytes: Long = 0L
+        // سقف 250 كيلوبايت للجلسة الواحدة لمنع التحميل المسبق والتهام الباقة
+        private val maxSessionBytes: Long = 250L * 1024L
         @Volatile private var connected = false
 
         fun connect() {
             try {
                 vpnService.protect(socket)
                 socket.tcpNoDelay = true
-                socket.receiveBufferSize = 8192
+                socket.receiveBufferSize = 4096
                 socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 8000)
                 connected = true
 
@@ -187,7 +225,7 @@ class PacketForwarder(
                 val buffer = ByteArray(1024)
                 while (running && connected && !socket.isClosed) {
                     val read = inStream.read(buffer)
-                    if (read == -1) {
+                    if (read == -1 || totalDownloadedBytes >= maxSessionBytes) {
                         val finPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x11, ByteArray(0))
                         mySeq = (mySeq + 1) and 0xFFFFFFFFL
                         writeToTun(finPkt)
@@ -195,6 +233,7 @@ class PacketForwarder(
                     }
                     if (read > 0) {
                         rateLimiter.acquire(read)
+                        totalDownloadedBytes += read
                         val chunk = buffer.copyOf(read)
                         val dataPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x18, chunk)
                         mySeq = (mySeq + read) and 0xFFFFFFFFL
@@ -309,7 +348,7 @@ class PacketForwarder(
         buf.putInt(ack.toInt())
         buf.put(0x50.toByte())
         buf.put(flags.toByte())
-        buf.putShort(8192.toShort())
+        buf.putShort(4096.toShort())
         buf.putShort(0)
         buf.putShort(0)
         buf.put(payload)
