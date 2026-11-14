@@ -42,6 +42,9 @@ class MyVpnService : VpnService() {
             .setSession("SpeedLimiter")
             .addAddress("10.0.0.2", 32)
             .addRoute("0.0.0.0", 0)
+            // اصطياد وحجب تسرب IPv6 لإجبار البث المباشر على المرور عبر IPv4 المقيّد
+            .addAddress("fd00:1:fd00:1:fd00:1:fd00:1", 128)
+            .addRoute("::", 0)
             .addDnsServer("8.8.8.8")
             .setMtu(1400)
 
