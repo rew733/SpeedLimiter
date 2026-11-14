@@ -14,7 +14,8 @@ import java.util.concurrent.Executors
 
 class PacketForwarder(
     private val vpnService: VpnService,
-    private val rateLimiter: RateLimiter
+    private val rateLimiter: RateLimiter,
+    private val maxSessionBytes: Long = 250L * 1024L
 ) {
     private val executor = Executors.newCachedThreadPool()
     private val tcpSessions = ConcurrentHashMap<String, TcpSession>()
@@ -77,7 +78,6 @@ class PacketForwarder(
         if (payloadLen <= 0) return
         val payload = rawPacket.copyOfRange(payloadOffset, rawPacket.size)
 
-        // الرد الفوري بجواب فارغ على استعلامات DNS AAAA (IPv6) لإجبار التطبيق على IPv4
         if (dstPort == 53 && isDnsAaaaQuery(payload)) {
             val emptyDnsResponse = buildEmptyDnsResponse(payload)
             val ipResponse = buildUdpIpPacket(dstIp, dstPort, srcIp, srcPort, emptyDnsResponse)
@@ -205,8 +205,6 @@ class PacketForwarder(
         private var mySeq: Long = 10000L
         private var clientNextSeq: Long = (initialClientSeq + 1) and 0xFFFFFFFFL
         private var totalDownloadedBytes: Long = 0L
-        // سقف 250 كيلوبايت للجلسة الواحدة لمنع التحميل المسبق والتهام الباقة
-        private val maxSessionBytes: Long = 250L * 1024L
         @Volatile private var connected = false
 
         fun connect() {
