@@ -11,7 +11,6 @@ import java.net.Socket
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
-import java.util.concurrent.Semaphore
 
 class PacketForwarder(
     private val vpnService: VpnService,
@@ -19,8 +18,6 @@ class PacketForwarder(
 ) {
     private val executor = Executors.newCachedThreadPool()
     private val tcpSessions = ConcurrentHashMap<String, TcpSession>()
-    // السماح باتصالين متزامنين فقط لمنع التحميل المسبق للفيديوهات التالية
-    private val connectionSlots = Semaphore(2)
     @Volatile private var running = false
 
     fun start(inputStream: FileInputStream, outputStream: FileOutputStream) {
@@ -173,18 +170,12 @@ class PacketForwarder(
         private var mySeq: Long = 10000L
         private var clientNextSeq: Long = (initialClientSeq + 1) and 0xFFFFFFFFL
         @Volatile private var connected = false
-        @Volatile private var slotAcquired = false
 
         fun connect() {
             try {
-                // انتظار توفر قناة اتصال من القناتين المسموحتين
-                connectionSlots.acquire()
-                slotAcquired = true
-
                 vpnService.protect(socket)
                 socket.tcpNoDelay = true
-                // ضبط حجم مخزن الاستقبال قبل الاتصال لإجبار نواة لينكس على إعلان نافذة صغيرة للخادم
-                socket.receiveBufferSize = 1024
+                socket.receiveBufferSize = 8192
                 socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 8000)
                 connected = true
 
@@ -193,7 +184,7 @@ class PacketForwarder(
                 writeToTun(synAck)
 
                 val inStream = socket.getInputStream()
-                val buffer = ByteArray(512)
+                val buffer = ByteArray(1024)
                 while (running && connected && !socket.isClosed) {
                     val read = inStream.read(buffer)
                     if (read == -1) {
@@ -251,10 +242,6 @@ class PacketForwarder(
 
         fun close() {
             connected = false
-            if (slotAcquired) {
-                slotAcquired = false
-                connectionSlots.release()
-            }
             try {
                 socket.close()
             } catch (_: Exception) {}
@@ -322,7 +309,7 @@ class PacketForwarder(
         buf.putInt(ack.toInt())
         buf.put(0x50.toByte())
         buf.put(flags.toByte())
-        buf.putShort(1024.toShort())
+        buf.putShort(8192.toShort())
         buf.putShort(0)
         buf.putShort(0)
         buf.put(payload)
