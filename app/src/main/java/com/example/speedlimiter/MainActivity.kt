@@ -1,6 +1,7 @@
 package com.example.speedlimiter
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -24,13 +25,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var sessionLimitInput: EditText
     private lateinit var searchInput: EditText
     private lateinit var toggleButton: Button
+    private lateinit var applyButton: Button
     private lateinit var listView: ListView
     private lateinit var adapter: AppAdapter
 
     private val allApps = mutableListOf<AppItem>()
     private val filteredApps = mutableListOf<AppItem>()
     private val selectedPackages = mutableSetOf<String>()
-    private var isVpnRunning = false
 
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -44,6 +45,12 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        val prefs = getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
+        val savedSpeed = prefs.getInt("speed_kb", 70)
+        val savedLimit = prefs.getInt("session_limit_kb", 250)
+        val savedApps = prefs.getStringSet("selected_apps", emptySet()) ?: emptySet()
+        selectedPackages.addAll(savedApps)
 
         val rootLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -66,7 +73,6 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, 0, 0, 20)
         }
 
-        // عمود السرعة (يمين)
         val speedCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
@@ -80,7 +86,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, 0, 0, 8)
         }
         speedInput = EditText(this).apply {
-            setText("70")
+            setText(savedSpeed.toString())
             inputType = InputType.TYPE_CLASS_NUMBER
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor("#2A2A2A"))
@@ -93,7 +99,6 @@ class MainActivity : AppCompatActivity() {
         speedCol.addView(speedLabel)
         speedCol.addView(speedInput)
 
-        // عمود سقف الجلسة (يسار)
         val sessionCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
@@ -107,7 +112,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, 0, 0, 8)
         }
         sessionLimitInput = EditText(this).apply {
-            setText("250")
+            setText(savedLimit.toString())
             inputType = InputType.TYPE_CLASS_NUMBER
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor("#2A2A2A"))
@@ -124,21 +129,47 @@ class MainActivity : AppCompatActivity() {
         controlsRow.addView(sessionCol)
         rootLayout.addView(controlsRow)
 
-        // زر التشغيل والإيقاف
+        // صف الأزرار: تشغيل/إيقاف + تطبيق القيم فوراً
+        val buttonsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
         toggleButton = Button(this).apply {
-            text = "تشغيل تحديد السرعة"
-            setBackgroundColor(Color.parseColor("#00C853"))
             setTextColor(Color.WHITE)
             setPadding(0, 24, 0, 24)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(0, 0, 8, 0)
+            }
             setOnClickListener {
-                if (isVpnRunning) {
+                if (MyVpnService.isServiceRunning) {
                     stopVpnService()
                 } else {
                     prepareAndStartVpn()
                 }
             }
         }
-        rootLayout.addView(toggleButton)
+
+        applyButton = Button(this).apply {
+            text = "تطبيق القيم"
+            setBackgroundColor(Color.parseColor("#2962FF"))
+            setTextColor(Color.WHITE)
+            setPadding(24, 24, 24, 24)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                setMargins(8, 0, 0, 0)
+            }
+            setOnClickListener {
+                prepareAndStartVpn()
+                Toast.makeText(this@MainActivity, "تم تحديث السرعة وحد الجلسة فوراً", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        buttonsRow.addView(toggleButton)
+        buttonsRow.addView(applyButton)
+        rootLayout.addView(buttonsRow)
 
         // مربع البحث
         searchInput = EditText(this).apply {
@@ -169,14 +200,41 @@ class MainActivity : AppCompatActivity() {
         setContentView(rootLayout)
 
         loadInstalledApps()
+        updateUiState()
 
         searchInput.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: Int, before: Int, count: Int) {}
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
                 filterApps(s?.toString() ?: "")
             }
             override fun afterTextChanged(s: Editable?) {}
         })
+    }
+
+    override fun onResume() {
+        super.onResume()
+        updateUiState()
+    }
+
+    private fun updateUiState() {
+        if (MyVpnService.isServiceRunning) {
+            toggleButton.text = "إيقاف تحديد السرعة"
+            toggleButton.setBackgroundColor(Color.parseColor("#D50000"))
+            applyButton.visibility = View.VISIBLE
+        } else {
+            toggleButton.text = "تشغيل تحديد السرعة"
+            toggleButton.setBackgroundColor(Color.parseColor("#00C853"))
+            applyButton.visibility = View.GONE
+        }
+    }
+
+    private fun savePreferences(speedKb: Int, sessionLimitKb: Int) {
+        getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE).edit()
+            .putInt("speed_kb", speedKb)
+            .putInt("session_limit_kb", sessionLimitKb)
+            .putStringSet("selected_apps", selectedPackages.toSet())
+            .apply()
     }
 
     private fun loadInstalledApps() {
@@ -191,7 +249,8 @@ class MainActivity : AppCompatActivity() {
             allApps.add(AppItem(label, appInfo.packageName, icon))
         }
 
-        allApps.sortBy { it.name.lowercase() }
+        // وضع التطبيقات المحددة في أعلى القائمة لسهولة الوصول
+        allApps.sortWith(compareByDescending<AppItem> { selectedPackages.contains(it.packageName) }.thenBy { it.name.lowercase() })
         filteredApps.clear()
         filteredApps.addAll(allApps)
 
@@ -228,6 +287,7 @@ class MainActivity : AppCompatActivity() {
     private fun startVpnService() {
         val speedKb = speedInput.text.toString().toIntOrNull() ?: 70
         val sessionLimitKb = sessionLimitInput.text.toString().toIntOrNull() ?: 250
+        savePreferences(speedKb, sessionLimitKb)
 
         val intent = Intent(this, MyVpnService::class.java).apply {
             putStringArrayListExtra("TARGET_APPS", ArrayList(selectedPackages))
@@ -236,9 +296,8 @@ class MainActivity : AppCompatActivity() {
         }
         ContextCompat.startForegroundService(this, intent)
 
-        isVpnRunning = true
-        toggleButton.text = "إيقاف تحديد السرعة"
-        toggleButton.setBackgroundColor(Color.parseColor("#D50000"))
+        MyVpnService.isServiceRunning = true
+        updateUiState()
     }
 
     private fun stopVpnService() {
@@ -247,9 +306,8 @@ class MainActivity : AppCompatActivity() {
         }
         startService(intent)
 
-        isVpnRunning = false
-        toggleButton.text = "تشغيل تحديد السرعة"
-        toggleButton.setBackgroundColor(Color.parseColor("#00C853"))
+        MyVpnService.isServiceRunning = false
+        updateUiState()
     }
 
     data class AppItem(val name: String, val packageName: String, val icon: Drawable)
@@ -283,10 +341,15 @@ class MainActivity : AppCompatActivity() {
             }
 
             val checkBox = CheckBox(this@MainActivity).apply {
+                setOnCheckedChangeListener(null)
                 isChecked = selectedPackages.contains(item.packageName)
                 setOnCheckedChangeListener { _, isChecked ->
                     if (isChecked) selectedPackages.add(item.packageName)
                     else selectedPackages.remove(item.packageName)
+                    savePreferences(
+                        speedInput.text.toString().toIntOrNull() ?: 70,
+                        sessionLimitInput.text.toString().toIntOrNull() ?: 250
+                    )
                 }
             }
 
