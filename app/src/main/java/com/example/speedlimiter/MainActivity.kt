@@ -1,367 +1,144 @@
 package com.example.speedlimiter
 
-import android.app.Activity
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
-import android.graphics.Color
-import android.graphics.drawable.Drawable
 import android.net.VpnService
-import android.os.Bundle
-import android.text.Editable
-import android.text.InputType
-import android.text.TextWatcher
-import android.view.Gravity
-import android.view.View
-import android.view.ViewGroup
-import android.widget.*
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AppCompatActivity
-import androidx.core.content.ContextCompat
+import android.os.Build
+import android.os.ParcelFileDescriptor
+import java.io.FileInputStream
+import java.io.FileOutputStream
 
-class MainActivity : AppCompatActivity() {
+class MyVpnService : VpnService() {
 
-    private lateinit var speedInput: EditText
-    private lateinit var sessionLimitInput: EditText
-    private lateinit var searchInput: EditText
-    private lateinit var toggleButton: Button
-    private lateinit var applyButton: Button
-    private lateinit var listView: ListView
-    private lateinit var adapter: AppAdapter
+    private var vpnInterface: ParcelFileDescriptor? = null
+    private var vpnThread: Thread? = null
+    private var packetForwarder: PacketForwarder? = null
 
-    private val allApps = mutableListOf<AppItem>()
-    private val filteredApps = mutableListOf<AppItem>()
-    private val selectedPackages = mutableSetOf<String>()
-
-    private val vpnPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        if (result.resultCode == Activity.RESULT_OK) {
-            startVpnService()
-        } else {
-            Toast.makeText(this, "تم رفض إذن الـ VPN", Toast.LENGTH_SHORT).show()
-        }
+    companion object {
+        @Volatile
+        var isServiceRunning = false
     }
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-
-        val prefs = getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
-        val savedSpeed = prefs.getInt("speed_kb", 70)
-        val savedLimit = prefs.getInt("session_limit_kb", 250)
-        val savedApps = prefs.getStringSet("selected_apps", emptySet()) ?: emptySet()
-        selectedPackages.addAll(savedApps)
-
-        val rootLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(32, 32, 32, 32)
-            setBackgroundColor(Color.parseColor("#121212"))
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == "STOP") {
+            stopVpn()
+            return START_NOT_STICKY
         }
 
-        val titleText = TextView(this).apply {
-            text = "مُحدّد سرعة الإنترنت للتطبيقات"
-            textSize = 20f
-            setTextColor(Color.WHITE)
-            setPadding(0, 0, 0, 20)
-        }
-        rootLayout.addView(titleText)
+        val targetPackages = intent?.getStringArrayListExtra("TARGET_APPS") ?: arrayListOf()
+        val speedKb = intent?.getIntExtra("SPEED_KB", 70) ?: 70
+        val sessionLimitKb = intent?.getIntExtra("SESSION_LIMIT_KB", 250) ?: 250
 
-        // صف أفقي يجمع خيار السرعة وخيار سقف الجلسة جنباً إلى جنب
-        val controlsRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, 0, 0, 20)
-        }
+        cleanupTunnel()
 
-        val speedCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                setMargins(0, 0, 12, 0)
-            }
-        }
-        val speedLabel = TextView(this).apply {
-            text = "السرعة (KB/s):"
-            textSize = 14f
-            setTextColor(Color.LTGRAY)
-            setPadding(0, 0, 0, 8)
-        }
-        speedInput = EditText(this).apply {
-            setText(savedSpeed.toString())
-            inputType = InputType.TYPE_CLASS_NUMBER
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#2A2A2A"))
-            setPadding(24, 16, 24, 16)
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-        }
-        speedCol.addView(speedLabel)
-        speedCol.addView(speedInput)
-
-        val sessionCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                setMargins(12, 0, 0, 0)
-            }
-        }
-        val sessionLabel = TextView(this).apply {
-            text = "حد الجلسة (KB) [0=بلا]:"
-            textSize = 14f
-            setTextColor(Color.LTGRAY)
-            setPadding(0, 0, 0, 8)
-        }
-        sessionLimitInput = EditText(this).apply {
-            setText(savedLimit.toString())
-            inputType = InputType.TYPE_CLASS_NUMBER
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#2A2A2A"))
-            setPadding(24, 16, 24, 16)
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-        }
-        sessionCol.addView(sessionLabel)
-        sessionCol.addView(sessionLimitInput)
-
-        controlsRow.addView(speedCol)
-        controlsRow.addView(sessionCol)
-        rootLayout.addView(controlsRow)
-
-        // صف الأزرار: تشغيل/إيقاف + تطبيق القيم فوراً
-        val buttonsRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-
-        toggleButton = Button(this).apply {
-            setTextColor(Color.WHITE)
-            setPadding(0, 24, 0, 24)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                setMargins(0, 0, 8, 0)
-            }
-            setOnClickListener {
-                if (MyVpnService.isServiceRunning) {
-                    stopVpnService()
-                } else {
-                    prepareAndStartVpn()
-                }
-            }
-        }
-
-        applyButton = Button(this).apply {
-            text = "تطبيق القيم"
-            setBackgroundColor(Color.parseColor("#2962FF"))
-            setTextColor(Color.WHITE)
-            setPadding(24, 24, 24, 24)
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply {
-                setMargins(8, 0, 0, 0)
-            }
-            setOnClickListener {
-                prepareAndStartVpn()
-                Toast.makeText(this@MainActivity, "تم تحديث السرعة وحد الجلسة فوراً", Toast.LENGTH_SHORT).show()
-            }
-        }
-
-        buttonsRow.addView(toggleButton)
-        buttonsRow.addView(applyButton)
-        rootLayout.addView(buttonsRow)
-
-        // مربع البحث
-        searchInput = EditText(this).apply {
-            hint = "ابحث عن تطبيق..."
-            setHintTextColor(Color.GRAY)
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#1E1E1E"))
-            setPadding(24, 20, 24, 20)
-            val params = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-            params.setMargins(0, 20, 0, 16)
-            layoutParams = params
-        }
-        rootLayout.addView(searchInput)
-
-        // قائمة التطبيقات
-        listView = ListView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                0,
-                1f
-            )
-        }
-        rootLayout.addView(listView)
-
-        setContentView(rootLayout)
-
-        loadInstalledApps()
-        updateUiState()
-
-        searchInput.addTextChangedListener(object : TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-            override fun onTextChanged(s: Int, before: Int, count: Int) {}
-            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
-                filterApps(s?.toString() ?: "")
-            }
-            override fun afterTextChanged(s: Editable?) {}
-        })
+        startForegroundNotification(speedKb, sessionLimitKb)
+        startVpn(targetPackages, speedKb, sessionLimitKb)
+        return START_STICKY
     }
 
-    override fun onResume() {
-        super.onResume()
-        updateUiState()
-    }
-
-    private fun updateUiState() {
-        if (MyVpnService.isServiceRunning) {
-            toggleButton.text = "إيقاف تحديد السرعة"
-            toggleButton.setBackgroundColor(Color.parseColor("#D50000"))
-            applyButton.visibility = View.VISIBLE
-        } else {
-            toggleButton.text = "تشغيل تحديد السرعة"
-            toggleButton.setBackgroundColor(Color.parseColor("#00C853"))
-            applyButton.visibility = View.GONE
-        }
-    }
-
-    private fun savePreferences(speedKb: Int, sessionLimitKb: Int) {
+    private fun startVpn(targetPackages: List<String>, speedKb: Int, sessionLimitKb: Int) {
+        isServiceRunning = true
         getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE).edit()
-            .putInt("speed_kb", speedKb)
-            .putInt("session_limit_kb", sessionLimitKb)
-            .putStringSet("selected_apps", selectedPackages.toSet())
-            .apply()
-    }
+            .putBoolean("is_running", true).apply()
 
-    private fun loadInstalledApps() {
-        val pm = packageManager
-        val packages = pm.getInstalledApplications(PackageManager.GET_META_DATA)
-        allApps.clear()
+        val rateLimiter = RateLimiter(speedKb.toLong() * 1024L)
+        val maxSessionBytes = if (sessionLimitKb > 0) sessionLimitKb.toLong() * 1024L else Long.MAX_VALUE
+        packetForwarder = PacketForwarder(this, rateLimiter, maxSessionBytes)
 
-        for (appInfo in packages) {
-            if (appInfo.packageName == packageName) continue
-            val label = pm.getApplicationLabel(appInfo).toString()
-            val icon = pm.getApplicationIcon(appInfo)
-            allApps.add(AppItem(label, appInfo.packageName, icon))
+        val builder = Builder()
+            .setSession("SpeedLimiter")
+            .addAddress("10.0.0.2", 32)
+            .addRoute("0.0.0.0", 0)
+            .addAddress("fd00:1:fd00:1:fd00:1:fd00:1", 128)
+            .addRoute("::", 0)
+            .addDnsServer("8.8.8.8")
+            .setMtu(1400)
+
+        for (pkg in targetPackages) {
+            try {
+                builder.addAllowedApplication(pkg)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
 
-        // وضع التطبيقات المحددة في أعلى القائمة لسهولة الوصول
-        allApps.sortWith(compareByDescending<AppItem> { selectedPackages.contains(it.packageName) }.thenBy { it.name.lowercase() })
-        filteredApps.clear()
-        filteredApps.addAll(allApps)
+        vpnInterface = builder.establish()
 
-        adapter = AppAdapter()
-        listView.adapter = adapter
+        vpnThread = Thread {
+            val fd = vpnInterface?.fileDescriptor ?: return@Thread
+            val inputStream = FileInputStream(fd)
+            val outputStream = FileOutputStream(fd)
+            try {
+                packetForwarder?.start(inputStream, outputStream)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+        vpnThread?.start()
     }
 
-    private fun filterApps(query: String) {
-        filteredApps.clear()
-        if (query.isBlank()) {
-            filteredApps.addAll(allApps)
+    private fun cleanupTunnel() {
+        packetForwarder?.stop()
+        packetForwarder = null
+        vpnThread?.interrupt()
+        vpnThread = null
+        try {
+            vpnInterface?.close()
+        } catch (_: Exception) {}
+        vpnInterface = null
+    }
+
+    private fun stopVpn() {
+        isServiceRunning = false
+        getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE).edit()
+            .putBoolean("is_running", false).apply()
+
+        cleanupTunnel()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun startForegroundNotification(speedKb: Int, sessionLimitKb: Int) {
+        val channelId = "speed_limiter_channel"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId,
+                "Speed Limiter Service",
+                NotificationManager.IMPORTANCE_LOW
+            )
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.createNotificationChannel(channel)
+        }
+
+        val limitText = if (sessionLimitKb > 0) " | حد الجلسة: ${sessionLimitKb}KB" else ""
+        val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, channelId)
+                .setContentTitle("Speed Limiter نشط")
+                .setContentText("السرعة: $speedKb KB/s$limitText")
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .build()
         } else {
-            val q = query.lowercase()
-            filteredApps.addAll(allApps.filter {
-                it.name.lowercase().contains(q) || it.packageName.lowercase().contains(q)
-            })
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+                .setContentTitle("Speed Limiter نشط")
+                .setContentText("السرعة: $speedKb KB/s$limitText")
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .build()
         }
-        adapter.notifyDataSetChanged()
+
+        startForeground(1, notification)
     }
 
-    private fun prepareAndStartVpn() {
-        if (selectedPackages.isEmpty()) {
-            Toast.makeText(this, "اختر تطبيقاً واحداً على الأقل", Toast.LENGTH_SHORT).show()
-            return
-        }
-        val intent = VpnService.prepare(this)
-        if (intent != null) {
-            vpnPermissionLauncher.launch(intent)
-        } else {
-            startVpnService()
-        }
+    override fun onRevoke() {
+        stopVpn()
+        super.onRevoke()
     }
 
-    private fun startVpnService() {
-        val speedKb = speedInput.text.toString().toIntOrNull() ?: 70
-        val sessionLimitKb = sessionLimitInput.text.toString().toIntOrNull() ?: 250
-        savePreferences(speedKb, sessionLimitKb)
-
-        val intent = Intent(this, MyVpnService::class.java).apply {
-            putStringArrayListExtra("TARGET_APPS", ArrayList(selectedPackages))
-            putExtra("SPEED_KB", speedKb)
-            putExtra("SESSION_LIMIT_KB", sessionLimitKb)
-        }
-        ContextCompat.startForegroundService(this, intent)
-
-        MyVpnService.isServiceRunning = true
-        updateUiState()
-    }
-
-    private fun stopVpnService() {
-        val intent = Intent(this, MyVpnService::class.java).apply {
-            action = "STOP"
-        }
-        startService(intent)
-
-        MyVpnService.isServiceRunning = false
-        updateUiState()
-    }
-
-    data class AppItem(val name: String, val packageName: String, val icon: Drawable)
-
-    inner class AppAdapter : BaseAdapter() {
-        override fun getCount(): Int = filteredApps.size
-        override fun getItem(position: Int): Any = filteredApps[position]
-        override fun getItemId(position: Int): Long = position.toLong()
-
-        override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
-            val row = (convertView as? LinearLayout) ?: LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(16, 20, 16, 20)
-            }
-            row.removeAllViews()
-
-            val item = filteredApps[position]
-
-            val iconView = ImageView(this@MainActivity).apply {
-                setImageDrawable(item.icon)
-                layoutParams = LinearLayout.LayoutParams(96, 96)
-            }
-
-            val nameView = TextView(this@MainActivity).apply {
-                text = item.name
-                textSize = 15f
-                setTextColor(Color.WHITE)
-                setPadding(24, 0, 16, 0)
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            }
-
-            val checkBox = CheckBox(this@MainActivity).apply {
-                setOnCheckedChangeListener(null)
-                isChecked = selectedPackages.contains(item.packageName)
-                setOnCheckedChangeListener { _, isChecked ->
-                    if (isChecked) selectedPackages.add(item.packageName)
-                    else selectedPackages.remove(item.packageName)
-                    savePreferences(
-                        speedInput.text.toString().toIntOrNull() ?: 70,
-                        sessionLimitInput.text.toString().toIntOrNull() ?: 250
-                    )
-                }
-            }
-
-            row.addView(iconView)
-            row.addView(nameView)
-            row.addView(checkBox)
-
-            row.setOnClickListener {
-                checkBox.isChecked = !checkBox.isChecked
-            }
-
-            return row
-        }
+    override fun onDestroy() {
+        stopVpn()
+        super.onDestroy()
     }
 }
