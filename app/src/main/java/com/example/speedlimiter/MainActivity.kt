@@ -22,7 +22,6 @@ import androidx.core.content.ContextCompat
 
 class MainActivity : AppCompatActivity() {
 
-    // تبويب السرعة
     private lateinit var speedInput: EditText
     private lateinit var sessionLimitInput: EditText
     private lateinit var searchInput: EditText
@@ -31,13 +30,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var speedListView: ListView
     private lateinit var speedAdapter: AppAdapter
 
-    // تبويب إيقاف الخلفية
     private lateinit var bgSearchInput: EditText
     private lateinit var selectAllBgButton: Button
     private lateinit var bgListView: ListView
     private lateinit var bgAdapter: BackgroundAppAdapter
 
-    // أزرار التنقل بين التبويبات
     private lateinit var tabSpeedBtn: Button
     private lateinit var tabBgBtn: Button
     private lateinit var speedLayoutContainer: LinearLayout
@@ -83,7 +80,6 @@ class MainActivity : AppCompatActivity() {
         }
         rootLayout.addView(titleText)
 
-        // شريط التبويبات العلوي
         val tabsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, 0, 0, 16)
@@ -111,7 +107,7 @@ class MainActivity : AppCompatActivity() {
         tabsRow.addView(tabBgBtn)
         rootLayout.addView(tabsRow)
 
-        // ==================== حاوية تبويب تحديد السرعة ====================
+        // تبويب السرعة
         speedLayoutContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
@@ -129,7 +125,7 @@ class MainActivity : AppCompatActivity() {
                 setMargins(0, 0, 8, 0)
             }
         }
-        speedCol.addView(TextView(this).apply { text = "السرعة (KB/s):"; textSize = 13f; textColor = Color.LTGRAY })
+        speedCol.addView(TextView(this).apply { text = "السرعة (KB/s):"; textSize = 13f; setTextColor(Color.LTGRAY) })
         speedInput = EditText(this).apply {
             setText(savedSpeed.toString())
             inputType = InputType.TYPE_CLASS_NUMBER
@@ -145,7 +141,7 @@ class MainActivity : AppCompatActivity() {
                 setMargins(8, 0, 0, 0)
             }
         }
-        sessionCol.addView(TextView(this).apply { text = "حد الجلسة (KB):"; textSize = 13f; textColor = Color.LTGRAY })
+        sessionCol.addView(TextView(this).apply { text = "حد الجلسة (KB):"; textSize = 13f; setTextColor(Color.LTGRAY) })
         sessionLimitInput = EditText(this).apply {
             setText(savedLimit.toString())
             inputType = InputType.TYPE_CLASS_NUMBER
@@ -208,7 +204,7 @@ class MainActivity : AppCompatActivity() {
         speedLayoutContainer.addView(speedListView)
         rootLayout.addView(speedLayoutContainer)
 
-        // ==================== حاوية تبويب إيقاف الخلفية ====================
+        // تبويب حظر الخلفية
         bgLayoutContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
@@ -305,7 +301,6 @@ class MainActivity : AppCompatActivity() {
         for (appInfo in packages) {
             if (appInfo.packageName == packageName) continue
 
-            // استبعاد تطبيقات النظام تماماً (لا يُعرض سوى تطبيقات المستخدم)
             val isSystemApp = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
             val isUpdatedSystemApp = (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
 
@@ -491,7 +486,7 @@ class MainActivity : AppCompatActivity() {
                 setPadding(12, 16, 12, 16)
             }
             row.removeAllViews()
-            val item = filteredBgApps[position]
+            val item = filteredBgApps.get(position)
 
             val iconView = ImageView(this@MainActivity).apply {
                 setImageDrawable(item.icon)
