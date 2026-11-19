@@ -92,15 +92,18 @@ class PacketForwarder(
 
     private fun isUidBlockedInBackground(uid: Int): Boolean {
         if (uid <= 0 || !bgBlockedUids.contains(uid)) return false
-        // إذا كان التطبيق مفتوحاً حالياً في الواجهة، يُسمح له بالإنترنت فوراً
         if (currentForegroundUid == uid) return false
         return true
     }
 
     private fun isUidSpeedLimited(uid: Int): Boolean {
         if (speedLimitedUids.isEmpty()) return false
-        if (uid <= 0) return true
-        return speedLimitedUids.contains(uid)
+        // إذا كان التطبيق في الواجهة غير مشمول بقائمة تحديد السرعة وموجود فقط في قائمة حظر الخلفية، لا نبطئ سرعته
+        if (uid > 10000 && !speedLimitedUids.contains(uid) && bgBlockedUids.contains(uid)) {
+            return false
+        }
+        // تطبيق تحديد السرعة على جميع الحزم المارة في النفق لضمان عدم تخطي الحد بسبب دقة النظام في كشف UID
+        return true
     }
 
     private fun handleOutgoingPacket(rawPacket: ByteArray, outputStream: FileOutputStream) {
