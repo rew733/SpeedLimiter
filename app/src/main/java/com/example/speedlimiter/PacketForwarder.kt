@@ -13,6 +13,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 class PacketForwarder(
     private val vpnService: VpnService,
@@ -24,10 +25,11 @@ class PacketForwarder(
     private val tcpSessions = ConcurrentHashMap<String, TcpSession>()
     @Volatile private var running = false
 
+    val totalBytesTransferred = AtomicLong(0L)
+
     fun start(inputStream: FileInputStream, outputStream: FileOutputStream) {
         running = true
 
-        // تنظيف دوري كل 15 ثانية لأي جلسة خاملة لأكثر من 15 ثانية
         cleaner.scheduleWithFixedDelay({
             val now = System.currentTimeMillis()
             val it = tcpSessions.entries.iterator()
@@ -115,16 +117,18 @@ class PacketForwarder(
             try {
                 socket = DatagramSocket()
                 vpnService.protect(socket)
-                socket.soTimeout = 1500 // مهلة 1.5 ثانية لمنع تراكم الطلبات
+                socket.soTimeout = 1500
 
                 val dstAddress = InetAddress.getByAddress(dstIp)
                 socket.send(DatagramPacket(payload, payload.size, dstAddress, dstPort))
+                totalBytesTransferred.addAndGet(payload.size.toLong())
 
                 val respBuf = ByteArray(2048)
                 val respPacket = DatagramPacket(respBuf, respBuf.size)
                 socket.receive(respPacket)
 
                 val respData = respPacket.data.copyOf(respPacket.length)
+                totalBytesTransferred.addAndGet(respData.size.toLong())
                 val ipResponse = buildUdpIpPacket(dstIp, dstPort, srcIp, srcPort, respData)
                 writeToTunSafe(outputStream, ipResponse)
             } catch (_: Exception) {
@@ -295,6 +299,7 @@ class PacketForwarder(
                             rateLimiter.acquire(read)
                         }
                         totalDownloadedBytes += read
+                        totalBytesTransferred.addAndGet(read.toLong())
                         val chunk = buffer.copyOf(read)
                         val dataPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x18, chunk)
                         mySeq = (mySeq + read) and 0xFFFFFFFFL
@@ -317,6 +322,7 @@ class PacketForwarder(
                     clientNextSeq = (seq + data.size) and 0xFFFFFFFFL
                     socket.getOutputStream().write(data)
                     socket.getOutputStream().flush()
+                    totalBytesTransferred.addAndGet(data.size.toLong())
                 }
                 val ackPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x10, ByteArray(0))
                 writeToTunSafe(outputStream, ackPkt)
