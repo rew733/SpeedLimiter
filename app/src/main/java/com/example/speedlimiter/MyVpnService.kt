@@ -263,17 +263,17 @@ class MyVpnService : VpnService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        val boostActionIntent = PendingIntent.getService(
+        val boostIntent = PendingIntent.getService(
             this,
             1,
-            Intent(this, MyVpnService::class.java).apply {
-                action = if (boostRemainingSec > 0) "STOP_BOOST" else "BOOST_3M"
-            },
+            Intent(this, MyVpnService::class.java).apply { action = "BOOST_3M" },
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        val stopIntent = PendingIntent.getService(
-            this, 2, Intent(this, MyVpnService::class.java).apply { action = "STOP" },
+        val stopBoostIntent = PendingIntent.getService(
+            this,
+            2,
+            Intent(this, MyVpnService::class.java).apply { action = "STOP_BOOST" },
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
@@ -295,15 +295,15 @@ class MyVpnService : VpnService() {
         }
 
         val boostAction = Notification.Action.Builder(
-            if (boostRemainingSec > 0) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_ff,
-            if (boostRemainingSec > 0) "🛑 إيقاف التعزيز" else "🚀 تعزيز 3د",
-            boostActionIntent
+            android.R.drawable.ic_media_ff,
+            "🚀 تعزيز 3د",
+            boostIntent
         ).build()
 
-        val stopAction = Notification.Action.Builder(
-            android.R.drawable.ic_menu_close_clear_cancel,
-            "إيقاف",
-            stopIntent
+        val stopBoostAction = Notification.Action.Builder(
+            android.R.drawable.ic_media_pause,
+            "🛑 إيقاف التعزيز",
+            stopBoostIntent
         ).build()
 
         return builder
@@ -314,7 +314,7 @@ class MyVpnService : VpnService() {
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .addAction(boostAction)
-            .addAction(stopAction)
+            .addAction(stopBoostAction)
             .build()
     }
 
