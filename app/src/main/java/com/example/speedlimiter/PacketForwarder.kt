@@ -27,13 +27,13 @@ class PacketForwarder(
     fun start(inputStream: FileInputStream, outputStream: FileOutputStream) {
         running = true
 
-        // مهمة دورية لتنظيف الجلسات المعلقة ومنع اختناق النفق
+        // تنظيف دوري كل 15 ثانية لأي جلسة خاملة لأكثر من 15 ثانية
         cleaner.scheduleWithFixedDelay({
             val now = System.currentTimeMillis()
             val it = tcpSessions.entries.iterator()
             while (it.hasNext()) {
                 val entry = it.next()
-                if (now - entry.value.lastActivityTime > 25_000L) {
+                if (now - entry.value.lastActivityTime > 15_000L) {
                     entry.value.close()
                     it.remove()
                 }
@@ -115,7 +115,7 @@ class PacketForwarder(
             try {
                 socket = DatagramSocket()
                 vpnService.protect(socket)
-                socket.soTimeout = 2000
+                socket.soTimeout = 1500 // مهلة 1.5 ثانية لمنع تراكم الطلبات
 
                 val dstAddress = InetAddress.getByAddress(dstIp)
                 socket.send(DatagramPacket(payload, payload.size, dstAddress, dstPort))
@@ -264,9 +264,9 @@ class PacketForwarder(
             try {
                 vpnService.protect(socket)
                 socket.tcpNoDelay = true
-                socket.soTimeout = 20000
+                socket.soTimeout = 15000
                 socket.receiveBufferSize = 8192
-                socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 5000)
+                socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 4000)
                 connected = true
                 lastActivityTime = System.currentTimeMillis()
 
@@ -291,7 +291,6 @@ class PacketForwarder(
                             writeToTunSafe(outputStream, rstPkt)
                             break
                         }
-                        // تمرير الحزم الصغيرة جداً فوراً (مثل رسائل واتساب والمصافحة) دون تجميد
                         if (read > 160) {
                             rateLimiter.acquire(read)
                         }
