@@ -4,7 +4,6 @@ import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.drawable.Drawable
@@ -277,7 +276,7 @@ class MainActivity : AppCompatActivity() {
         bgLayoutContainer.addView(bgHeaderRow)
 
         val bgInfoText = TextView(this).apply {
-            text = "التطبيقات المحددة هنا سيتم إيقاف نشاطها في الخلفية تلقائياً (تطبيقات النظام مستثناة بالكامل لحماية النظام)."
+            text = "التطبيقات المحددة هنا سيتم إيقاف نشاطها في الخلفية تلقائياً (خدمات النظام الخفية مستثناة لحماية النظام)."
             textSize = 11f
             setTextColor(Color.parseColor("#B0BEC5"))
             setPadding(0, 0, 0, 8)
@@ -336,10 +335,10 @@ class MainActivity : AppCompatActivity() {
         for (appInfo in packages) {
             if (appInfo.packageName == packageName) continue
 
-            // استبعاد أي تطبيق نظام بالكامل (سواء أساسي أو محدث) من الظهور أو التحديد
-            val isSystemApp = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
-            val isUpdatedSystemApp = (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
-            if (isSystemApp || isUpdatedSystemApp) continue
+            // جلب التطبيقات التي يفتحها المستخدم فعلياً (لها واجهة تشغيل) مثل يوتيوب وفيسبوك وتيك توك وكروم
+            // واستبعاد خدمات النظام الخفية التي لا يفتحها المستخدم
+            val hasLauncher = pm.getLaunchIntentForPackage(appInfo.packageName) != null
+            if (!hasLauncher) continue
 
             val label = pm.getApplicationLabel(appInfo).toString()
             val icon = pm.getApplicationIcon(appInfo)
