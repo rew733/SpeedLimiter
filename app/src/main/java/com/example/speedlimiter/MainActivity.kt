@@ -28,6 +28,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var speedInput: EditText
     private lateinit var sessionLimitInput: EditText
     private lateinit var searchInput: EditText
+    private lateinit var selectAllSpeedButton: Button
     private lateinit var toggleButton: Button
     private lateinit var applyButton: Button
     private lateinit var speedListView: ListView
@@ -196,18 +197,40 @@ class MainActivity : AppCompatActivity() {
         buttonsRow.addView(applyButton)
         speedLayoutContainer.addView(buttonsRow)
 
+        val speedSearchRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, 8)
+        }
+
         searchInput = EditText(this).apply {
             hint = "ابحث في التطبيقات..."
             setHintTextColor(Color.GRAY)
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor("#1E1E1E"))
             setPadding(16, 14, 16, 14)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(0, 0, 8, 0)
+            }
         }
-        speedLayoutContainer.addView(searchInput)
+
+        selectAllSpeedButton = Button(this).apply {
+            text = "تحديد الكل"
+            setBackgroundColor(Color.parseColor("#37474F"))
+            setTextColor(Color.WHITE)
+            setPadding(16, 10, 16, 10)
+            setOnClickListener {
+                toggleSelectAllSpeedApps()
+            }
+        }
+
+        speedSearchRow.addView(searchInput)
+        speedSearchRow.addView(selectAllSpeedButton)
+        speedLayoutContainer.addView(speedSearchRow)
 
         speedListView = ListView(this).apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f).apply {
-                setMargins(0, 10, 0, 0)
+                setMargins(0, 4, 0, 0)
             }
         }
         speedLayoutContainer.addView(speedListView)
@@ -268,6 +291,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(rootLayout)
 
         loadInstalledApps()
+        updateSelectAllButtonsText()
         updateUiState()
         switchTab(0)
 
@@ -357,17 +381,44 @@ class MainActivity : AppCompatActivity() {
         bgAdapter.notifyDataSetChanged()
     }
 
+    private fun updateSelectAllButtonsText() {
+        val allUserPackages = userApps.map { it.packageName }.toSet()
+        if (allUserPackages.isNotEmpty() && selectedSpeedPackages.containsAll(allUserPackages)) {
+            selectAllSpeedButton.text = "إلغاء التحديد"
+        } else {
+            selectAllSpeedButton.text = "تحديد الكل"
+        }
+
+        if (allUserPackages.isNotEmpty() && selectedBgKillPackages.containsAll(allUserPackages)) {
+            selectAllBgButton.text = "إلغاء التحديد"
+        } else {
+            selectAllBgButton.text = "تحديد الكل"
+        }
+    }
+
+    private fun toggleSelectAllSpeedApps() {
+        val allUserPackages = userApps.map { it.packageName }.toSet()
+        if (selectedSpeedPackages.containsAll(allUserPackages)) {
+            selectedSpeedPackages.clear()
+        } else {
+            selectedSpeedPackages.clear()
+            selectedSpeedPackages.addAll(allUserPackages)
+        }
+        savePreferences()
+        updateSelectAllButtonsText()
+        speedAdapter.notifyDataSetChanged()
+    }
+
     private fun toggleSelectAllBackgroundApps() {
         val allUserPackages = userApps.map { it.packageName }.toSet()
         if (selectedBgKillPackages.containsAll(allUserPackages)) {
             selectedBgKillPackages.clear()
-            selectAllBgButton.text = "تحديد الكل"
         } else {
             selectedBgKillPackages.clear()
             selectedBgKillPackages.addAll(allUserPackages)
-            selectAllBgButton.text = "إلغاء التحديد"
         }
         savePreferences()
+        updateSelectAllButtonsText()
         bgAdapter.notifyDataSetChanged()
     }
 
@@ -472,6 +523,7 @@ class MainActivity : AppCompatActivity() {
                     if (isChecked) selectedSpeedPackages.add(item.packageName)
                     else selectedSpeedPackages.remove(item.packageName)
                     savePreferences()
+                    updateSelectAllButtonsText()
                 }
             }
 
@@ -515,6 +567,7 @@ class MainActivity : AppCompatActivity() {
                     if (isChecked) selectedBgKillPackages.add(item.packageName)
                     else selectedBgKillPackages.remove(item.packageName)
                     savePreferences()
+                    updateSelectAllButtonsText()
                 }
             }
 
