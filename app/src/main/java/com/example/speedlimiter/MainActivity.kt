@@ -1,5 +1,6 @@
 package com.example.speedlimiter
 
+import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
@@ -8,6 +9,7 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.drawable.Drawable
 import android.net.VpnService
+import android.os.Build
 import android.os.Bundle
 import android.text.Editable
 import android.text.InputType
@@ -18,6 +20,7 @@ import android.view.ViewGroup
 import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 
 class MainActivity : AppCompatActivity() {
@@ -59,6 +62,13 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // طلب إذن الإشعارات تلقائياً في أندرويد 13 و14 لإظهار عداد السرعة وزر التعزيز
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101)
+            }
+        }
 
         val prefs = getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
         val savedSpeed = prefs.getInt("speed_kb", 70)
@@ -486,7 +496,7 @@ class MainActivity : AppCompatActivity() {
                 setPadding(12, 16, 12, 16)
             }
             row.removeAllViews()
-            val item = filteredBgApps.get(position)
+            val item = filteredBgApps[position]
 
             val iconView = ImageView(this@MainActivity).apply {
                 setImageDrawable(item.icon)
