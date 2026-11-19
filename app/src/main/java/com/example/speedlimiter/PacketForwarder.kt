@@ -30,17 +30,18 @@ class PacketForwarder(
     fun start(inputStream: FileInputStream, outputStream: FileOutputStream) {
         running = true
 
+        // تنظيف الجلسات الخاملة فقط (التي توقفت لأكثر من 60 ثانية) دون قطع الجلسات النشطة
         cleaner.scheduleWithFixedDelay({
             val now = System.currentTimeMillis()
             val it = tcpSessions.entries.iterator()
             while (it.hasNext()) {
                 val entry = it.next()
-                if (now - entry.value.lastActivityTime > 15_000L) {
+                if (now - entry.value.lastActivityTime > 60_000L) {
                     entry.value.close()
                     it.remove()
                 }
             }
-        }, 15, 15, TimeUnit.SECONDS)
+        }, 20, 20, TimeUnit.SECONDS)
 
         val packet = ByteBuffer.allocate(32767)
 
@@ -62,19 +63,28 @@ class PacketForwarder(
         }
     }
 
+    // تنظيف الجلسات المتراكمة غير النشطة فقط دون قطع البث أو الردود الجارية
     fun refreshSessions() {
+        val now = System.currentTimeMillis()
         val it = tcpSessions.entries.iterator()
         while (it.hasNext()) {
             val entry = it.next()
-            entry.value.close()
-            it.remove()
+            if (now - entry.value.lastActivityTime > 30_000L) {
+                entry.value.close()
+                it.remove()
+            }
         }
     }
 
     fun stop() {
         running = false
         try { cleaner.shutdownNow() } catch (_: Exception) {}
-        refreshSessions()
+        val it = tcpSessions.entries.iterator()
+        while (it.hasNext()) {
+            val entry = it.next()
+            entry.value.close()
+            it.remove()
+        }
         try { executor.shutdownNow() } catch (_: Exception) {}
     }
 
@@ -106,6 +116,15 @@ class PacketForwarder(
         val srcPort = ((rawPacket[ipHeaderLen].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 1].toInt() and 0xFF)
         val dstPort = ((rawPacket[ipHeaderLen + 2].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 3].toInt() and 0xFF)
 
+        // إرسال رفض فوري (ICMP Port Unreachable) لبروتوكول QUIC (UDP 443) لتحويل يوتيوب وGemini فوراً إلى TCP
+        if (dstPort == 443) {
+            val icmpUnreachable = buildIcmpPortUnreachable(rawPacket, ipHeaderLen)
+            if (icmpUnreachable != null) {
+                writeToTunSafe(outputStream, icmpUnreachable)
+            }
+            return
+        }
+
         if (dstPort != 53) return
 
         val payloadOffset = ipHeaderLen + 8
@@ -125,7 +144,7 @@ class PacketForwarder(
             try {
                 socket = DatagramSocket()
                 vpnService.protect(socket)
-                socket.soTimeout = 1500
+                socket.soTimeout = 2000
 
                 val dstAddress = InetAddress.getByAddress(dstIp)
                 socket.send(DatagramPacket(payload, payload.size, dstAddress, dstPort))
@@ -274,12 +293,13 @@ class PacketForwarder(
 
         fun connect() {
             try {
-                rateLimiter.acquire(1024)
+                rateLimiter.acquire(512)
                 vpnService.protect(socket)
                 socket.tcpNoDelay = true
-                socket.soTimeout = 15000
-                socket.receiveBufferSize = 2048
-                socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 4000)
+                // مهلة 45 ثانية لمنع انقطاع الردود الطويلة في Gemini أو البث المباشر
+                socket.soTimeout = 45000
+                socket.receiveBufferSize = 4096
+                socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 6000)
                 connected = true
                 lastActivityTime = System.currentTimeMillis()
 
@@ -288,7 +308,7 @@ class PacketForwarder(
                 writeToTunSafe(outputStream, synAck)
 
                 val inStream = socket.getInputStream()
-                val buffer = ByteArray(1024)
+                val buffer = ByteArray(1200)
                 while (running && connected && !socket.isClosed) {
                     val read = inStream.read(buffer)
                     lastActivityTime = System.currentTimeMillis()
@@ -357,6 +377,35 @@ class PacketForwarder(
         }
     }
 
+    private fun buildIcmpPortUnreachable(originalPacket: ByteArray, ipHeaderLen: Int): ByteArray? {
+        val quotedLen = (ipHeaderLen + 8).coerceAtMost(originalPacket.size)
+        if (quotedLen < 28) return null
+        val icmpLen = 8 + quotedLen
+        val totalLen = 20 + icmpLen
+        val buf = ByteBuffer.allocate(totalLen)
+
+        buf.put(0x45.toByte())
+        buf.put(0x00.toByte())
+        buf.putShort(totalLen.toShort())
+        buf.putShort(0)
+        buf.putShort(0x4000.toShort())
+        buf.put(64.toByte())
+        buf.put(1.toByte())
+        buf.putShort(0)
+        buf.put(originalPacket, 16, 4)
+        buf.put(originalPacket, 12, 4)
+        buf.putShort(10, computeChecksum(buf.array(), 0, 20))
+
+        buf.put(3.toByte())
+        buf.put(3.toByte())
+        buf.putShort(0)
+        buf.putInt(0)
+        buf.put(originalPacket, 0, quotedLen)
+        buf.putShort(22, computeChecksum(buf.array(), 20, icmpLen))
+
+        return buf.array()
+    }
+
     private fun buildUdpIpPacket(srcIp: ByteArray, srcPort: Int, dstIp: ByteArray, dstPort: Int, payload: ByteArray): ByteArray {
         val udpLen = 8 + payload.size
         val totalLen = 20 + udpLen
@@ -418,7 +467,7 @@ class PacketForwarder(
         buf.putInt(ack.toInt())
         buf.put(0x50.toByte())
         buf.put(flags.toByte())
-        buf.putShort(2048.toShort())
+        buf.putShort(4096.toShort())
         buf.putShort(0)
         buf.putShort(0)
         buf.put(payload)
