@@ -11,18 +11,35 @@ import java.net.Socket
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 
 class PacketForwarder(
     private val vpnService: VpnService,
     private val rateLimiter: RateLimiter,
     private val maxSessionBytes: Long = Long.MAX_VALUE
 ) {
-    private val executor = Executors.newCachedThreadPool()
+    private val executor = Executors.newFixedThreadPool(36)
+    private val cleaner: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
     private val tcpSessions = ConcurrentHashMap<String, TcpSession>()
     @Volatile private var running = false
 
     fun start(inputStream: FileInputStream, outputStream: FileOutputStream) {
         running = true
+
+        // مهمة دورية لتنظيف الجلسات المعلقة ومنع اختناق النفق
+        cleaner.scheduleWithFixedDelay({
+            val now = System.currentTimeMillis()
+            val it = tcpSessions.entries.iterator()
+            while (it.hasNext()) {
+                val entry = it.next()
+                if (now - entry.value.lastActivityTime > 25_000L) {
+                    entry.value.close()
+                    it.remove()
+                }
+            }
+        }, 15, 15, TimeUnit.SECONDS)
+
         val packet = ByteBuffer.allocate(32767)
 
         while (running && !Thread.currentThread().isInterrupted) {
@@ -45,9 +62,10 @@ class PacketForwarder(
 
     fun stop() {
         running = false
+        try { cleaner.shutdownNow() } catch (_: Exception) {}
         tcpSessions.values.forEach { it.close() }
         tcpSessions.clear()
-        executor.shutdownNow()
+        try { executor.shutdownNow() } catch (_: Exception) {}
     }
 
     private fun handleOutgoingPacket(rawPacket: ByteArray, outputStream: FileOutputStream) {
@@ -78,7 +96,6 @@ class PacketForwarder(
         val srcPort = ((rawPacket[ipHeaderLen].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 1].toInt() and 0xFF)
         val dstPort = ((rawPacket[ipHeaderLen + 2].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 3].toInt() and 0xFF)
 
-        // حظر QUIC (UDP 443) لإجبار التطبيقات على استخدام TCP المنضبط
         if (dstPort == 443) return
 
         val payloadOffset = ipHeaderLen + 8
@@ -89,9 +106,7 @@ class PacketForwarder(
         if (dstPort == 53 && isDnsAaaaQuery(payload)) {
             val emptyDnsResponse = buildEmptyDnsResponse(payload)
             val ipResponse = buildUdpIpPacket(dstIp, dstPort, srcIp, srcPort, emptyDnsResponse)
-            synchronized(outputStream) {
-                try { outputStream.write(ipResponse) } catch (_: Exception) {}
-            }
+            writeToTunSafe(outputStream, ipResponse)
             return
         }
 
@@ -100,24 +115,30 @@ class PacketForwarder(
             try {
                 socket = DatagramSocket()
                 vpnService.protect(socket)
-                socket.soTimeout = 5000
+                socket.soTimeout = 2000
 
                 val dstAddress = InetAddress.getByAddress(dstIp)
                 socket.send(DatagramPacket(payload, payload.size, dstAddress, dstPort))
 
-                val respBuf = ByteArray(4096)
+                val respBuf = ByteArray(2048)
                 val respPacket = DatagramPacket(respBuf, respBuf.size)
                 socket.receive(respPacket)
 
                 val respData = respPacket.data.copyOf(respPacket.length)
                 val ipResponse = buildUdpIpPacket(dstIp, dstPort, srcIp, srcPort, respData)
-                synchronized(outputStream) {
-                    outputStream.write(ipResponse)
-                }
+                writeToTunSafe(outputStream, ipResponse)
             } catch (_: Exception) {
             } finally {
                 try { socket?.close() } catch (_: Exception) {}
             }
+        }
+    }
+
+    private fun writeToTunSafe(outputStream: FileOutputStream, packet: ByteArray) {
+        synchronized(outputStream) {
+            try {
+                outputStream.write(packet)
+            } catch (_: Exception) {}
         }
     }
 
@@ -142,12 +163,11 @@ class PacketForwarder(
     }
 
     private fun buildEmptyDnsResponse(query: ByteArray): ByteArray {
-        // استخراج رأس DNS + قسم السؤال فقط وتصفير الإجابات والملحقات
         var pos = 12
         while (pos < query.size) {
             val len = query[pos].toInt() and 0xFF
             if (len == 0) {
-                pos += 5 // null byte + QTYPE (2) + QCLASS (2)
+                pos += 5
                 break
             }
             if ((len and 0xC0) == 0xC0) {
@@ -159,11 +179,11 @@ class PacketForwarder(
         val endPos = pos.coerceAtMost(query.size)
         val resp = query.copyOf(endPos)
         if (resp.size >= 12) {
-            resp[2] = 0x81.toByte() // QR=1, RD=1
-            resp[3] = 0x80.toByte() // RA=1, RCODE=0 (NoError)
-            resp[6] = 0; resp[7] = 0   // ANCOUNT = 0
-            resp[8] = 0; resp[9] = 0   // NSCOUNT = 0
-            resp[10] = 0; resp[11] = 0 // ARCOUNT = 0
+            resp[2] = 0x81.toByte()
+            resp[3] = 0x80.toByte()
+            resp[6] = 0; resp[7] = 0
+            resp[8] = 0; resp[9] = 0
+            resp[10] = 0; resp[11] = 0
         }
         return resp
     }
@@ -211,6 +231,7 @@ class PacketForwarder(
         }
 
         val session = tcpSessions[sessionKey] ?: return
+        session.lastActivityTime = System.currentTimeMillis()
 
         if (fin) {
             session.handleClientFin(seqNum)
@@ -236,44 +257,49 @@ class PacketForwarder(
         private var mySeq: Long = 10000L
         private var clientNextSeq: Long = (initialClientSeq + 1) and 0xFFFFFFFFL
         private var totalDownloadedBytes: Long = 0L
+        @Volatile var lastActivityTime: Long = System.currentTimeMillis()
         @Volatile private var connected = false
 
         fun connect() {
             try {
                 vpnService.protect(socket)
                 socket.tcpNoDelay = true
-                socket.soTimeout = 30000
+                socket.soTimeout = 20000
                 socket.receiveBufferSize = 8192
-                socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 8000)
+                socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 5000)
                 connected = true
+                lastActivityTime = System.currentTimeMillis()
 
                 val synAck = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x12, ByteArray(0))
                 mySeq = (mySeq + 1) and 0xFFFFFFFFL
-                writeToTun(synAck)
+                writeToTunSafe(outputStream, synAck)
 
                 val inStream = socket.getInputStream()
                 val buffer = ByteArray(1200)
                 while (running && connected && !socket.isClosed) {
                     val read = inStream.read(buffer)
+                    lastActivityTime = System.currentTimeMillis()
                     if (read == -1) {
                         val finPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x11, ByteArray(0))
                         mySeq = (mySeq + 1) and 0xFFFFFFFFL
-                        writeToTun(finPkt)
+                        writeToTunSafe(outputStream, finPkt)
                         break
                     }
                     if (read > 0) {
                         if (maxSessionBytes != Long.MAX_VALUE && totalDownloadedBytes >= maxSessionBytes) {
-                            // إرسال RST لإجبار التطبيق على فتح اتصال جديد نظيف بدلاً من تعليق الصفحة
                             val rstPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x14, ByteArray(0))
-                            writeToTun(rstPkt)
+                            writeToTunSafe(outputStream, rstPkt)
                             break
                         }
-                        rateLimiter.acquire(read)
+                        // تمرير الحزم الصغيرة جداً فوراً (مثل رسائل واتساب والمصافحة) دون تجميد
+                        if (read > 160) {
+                            rateLimiter.acquire(read)
+                        }
                         totalDownloadedBytes += read
                         val chunk = buffer.copyOf(read)
                         val dataPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x18, chunk)
                         mySeq = (mySeq + read) and 0xFFFFFFFFL
-                        writeToTun(dataPkt)
+                        writeToTunSafe(outputStream, dataPkt)
                     }
                 }
             } catch (_: Exception) {
@@ -287,13 +313,14 @@ class PacketForwarder(
         fun sendToRemote(data: ByteArray, seq: Long) {
             if (!connected || socket.isClosed) return
             try {
+                lastActivityTime = System.currentTimeMillis()
                 if (seq == clientNextSeq) {
                     clientNextSeq = (seq + data.size) and 0xFFFFFFFFL
                     socket.getOutputStream().write(data)
                     socket.getOutputStream().flush()
                 }
                 val ackPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x10, ByteArray(0))
-                writeToTun(ackPkt)
+                writeToTunSafe(outputStream, ackPkt)
             } catch (_: Exception) {
                 close()
             }
@@ -304,17 +331,9 @@ class PacketForwarder(
             try {
                 clientNextSeq = (seq + 1) and 0xFFFFFFFFL
                 val finAck = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x11, ByteArray(0))
-                writeToTun(finAck)
+                writeToTunSafe(outputStream, finAck)
             } catch (_: Exception) {}
             close()
-        }
-
-        private fun writeToTun(pkt: ByteArray) {
-            synchronized(outputStream) {
-                try {
-                    outputStream.write(pkt)
-                } catch (_: Exception) {}
-            }
         }
 
         fun close() {
