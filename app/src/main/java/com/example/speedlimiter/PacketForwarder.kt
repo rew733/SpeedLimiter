@@ -1,6 +1,10 @@
 package com.example.speedlimiter
 
+import android.content.Context
+import android.net.ConnectivityManager
 import android.net.VpnService
+import android.os.Build
+import android.system.OsConstants
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.DatagramPacket
@@ -18,12 +22,17 @@ import java.util.concurrent.atomic.AtomicLong
 class PacketForwarder(
     private val vpnService: VpnService,
     private val rateLimiter: RateLimiter,
-    private val maxSessionBytes: Long = Long.MAX_VALUE
+    private val maxSessionBytes: Long = Long.MAX_VALUE,
+    private val speedLimitedUids: Set<Int> = emptySet(),
+    private val bgBlockedUids: Set<Int> = emptySet()
 ) {
     private val executor = Executors.newFixedThreadPool(36)
     private val cleaner: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
     private val tcpSessions = ConcurrentHashMap<String, TcpSession>()
+    private val connectivityManager = vpnService.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+
     @Volatile private var running = false
+    @Volatile var currentForegroundUid: Int = -1
 
     val totalBytesTransferred = AtomicLong(0L)
 
@@ -70,6 +79,30 @@ class PacketForwarder(
         try { executor.shutdownNow() } catch (_: Exception) {}
     }
 
+    private fun resolveOwnerUid(protocol: Int, srcIp: ByteArray, srcPort: Int, dstIp: ByteArray, dstPort: Int): Int {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val local = InetSocketAddress(InetAddress.getByAddress(srcIp), srcPort)
+                val remote = InetSocketAddress(InetAddress.getByAddress(dstIp), dstPort)
+                return connectivityManager.getConnectionOwnerUid(protocol, local, remote)
+            } catch (_: Exception) {}
+        }
+        return -1
+    }
+
+    private fun isUidBlockedInBackground(uid: Int): Boolean {
+        if (uid <= 0 || !bgBlockedUids.contains(uid)) return false
+        // إذا كان التطبيق مفتوحاً حالياً في الواجهة، يُسمح له بالإنترنت فوراً
+        if (currentForegroundUid == uid) return false
+        return true
+    }
+
+    private fun isUidSpeedLimited(uid: Int): Boolean {
+        if (speedLimitedUids.isEmpty()) return false
+        if (uid <= 0) return true
+        return speedLimitedUids.contains(uid)
+    }
+
     private fun handleOutgoingPacket(rawPacket: ByteArray, outputStream: FileOutputStream) {
         if (rawPacket.size < 20) return
         val version = (rawPacket[0].toInt() shr 4) and 0x0F
@@ -99,6 +132,9 @@ class PacketForwarder(
         val dstPort = ((rawPacket[ipHeaderLen + 2].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 3].toInt() and 0xFF)
 
         if (dstPort == 443) return
+
+        val ownerUid = resolveOwnerUid(OsConstants.IPPROTO_UDP, srcIp, srcPort, dstIp, dstPort)
+        if (isUidBlockedInBackground(ownerUid)) return
 
         val payloadOffset = ipHeaderLen + 8
         val payloadLen = rawPacket.size - payloadOffset
@@ -212,14 +248,20 @@ class PacketForwarder(
         val fin = (flags and 0x01) != 0
         val rst = (flags and 0x04) != 0
 
+        val ownerUid = resolveOwnerUid(OsConstants.IPPROTO_TCP, srcIp, srcPort, dstIp, dstPort)
+        val sessionKey = "${InetAddress.getByAddress(srcIp).hostAddress}:$srcPort-${InetAddress.getByAddress(dstIp).hostAddress}:$dstPort"
+
+        if (isUidBlockedInBackground(ownerUid)) {
+            tcpSessions.remove(sessionKey)?.close()
+            return
+        }
+
         val payloadOffset = ipHeaderLen + tcpHeaderLen
         val payload = if (rawPacket.size > payloadOffset) {
             rawPacket.copyOfRange(payloadOffset, rawPacket.size)
         } else {
             ByteArray(0)
         }
-
-        val sessionKey = "${InetAddress.getByAddress(srcIp).hostAddress}:$srcPort-${InetAddress.getByAddress(dstIp).hostAddress}:$dstPort"
 
         if (rst) {
             tcpSessions.remove(sessionKey)?.close()
@@ -228,13 +270,20 @@ class PacketForwarder(
 
         if (syn && !ack) {
             tcpSessions.remove(sessionKey)?.close()
-            val session = TcpSession(sessionKey, srcIp, srcPort, dstIp, dstPort, seqNum, outputStream)
+            val applyLimit = isUidSpeedLimited(ownerUid)
+            val session = TcpSession(sessionKey, srcIp, srcPort, dstIp, dstPort, seqNum, outputStream, ownerUid, applyLimit)
             tcpSessions[sessionKey] = session
             executor.execute { session.connect() }
             return
         }
 
         val session = tcpSessions[sessionKey] ?: return
+        if (isUidBlockedInBackground(session.ownerUid)) {
+            session.close()
+            tcpSessions.remove(sessionKey)
+            return
+        }
+
         session.lastActivityTime = System.currentTimeMillis()
 
         if (fin) {
@@ -255,7 +304,9 @@ class PacketForwarder(
         private val remoteIp: ByteArray,
         private val remotePort: Int,
         initialClientSeq: Long,
-        private val outputStream: FileOutputStream
+        private val outputStream: FileOutputStream,
+        val ownerUid: Int,
+        private val applySpeedLimit: Boolean
     ) {
         private val socket = Socket()
         private var mySeq: Long = 10000L
@@ -281,6 +332,9 @@ class PacketForwarder(
                 val inStream = socket.getInputStream()
                 val buffer = ByteArray(1200)
                 while (running && connected && !socket.isClosed) {
+                    if (isUidBlockedInBackground(ownerUid)) {
+                        break
+                    }
                     val read = inStream.read(buffer)
                     lastActivityTime = System.currentTimeMillis()
                     if (read == -1) {
@@ -290,12 +344,12 @@ class PacketForwarder(
                         break
                     }
                     if (read > 0) {
-                        if (maxSessionBytes != Long.MAX_VALUE && totalDownloadedBytes >= maxSessionBytes) {
+                        if (applySpeedLimit && maxSessionBytes != Long.MAX_VALUE && totalDownloadedBytes >= maxSessionBytes) {
                             val rstPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x14, ByteArray(0))
                             writeToTunSafe(outputStream, rstPkt)
                             break
                         }
-                        if (read > 160) {
+                        if (applySpeedLimit && read > 160) {
                             rateLimiter.acquire(read)
                         }
                         totalDownloadedBytes += read
