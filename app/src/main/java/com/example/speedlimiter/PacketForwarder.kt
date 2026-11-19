@@ -106,14 +106,15 @@ class PacketForwarder(
         val srcPort = ((rawPacket[ipHeaderLen].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 1].toInt() and 0xFF)
         val dstPort = ((rawPacket[ipHeaderLen + 2].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 3].toInt() and 0xFF)
 
-        if (dstPort == 443) return
+        // السماح بمنفذ DNS (53) فقط وإسقاط بقية منافذ UDP لإجبار البث المباشر على المرور عبر TCP المقيّد
+        if (dstPort != 53) return
 
         val payloadOffset = ipHeaderLen + 8
         val payloadLen = rawPacket.size - payloadOffset
         if (payloadLen <= 0) return
         val payload = rawPacket.copyOfRange(payloadOffset, rawPacket.size)
 
-        if (dstPort == 53 && isDnsAaaaQuery(payload)) {
+        if (isDnsAaaaQuery(payload)) {
             val emptyDnsResponse = buildEmptyDnsResponse(payload)
             val ipResponse = buildUdpIpPacket(dstIp, dstPort, srcIp, srcPort, emptyDnsResponse)
             writeToTunSafe(outputStream, ipResponse)
@@ -274,12 +275,10 @@ class PacketForwarder(
 
         fun connect() {
             try {
-                // تقييد تدفق فتح الاتصالات المتزامنة لمنع قفزات السرعة
                 rateLimiter.acquire(1024)
                 vpnService.protect(socket)
                 socket.tcpNoDelay = true
                 socket.soTimeout = 15000
-                // تقليص ذاكرة الاستقبال قبل الاتصال للتحكم في نافذة الخادم
                 socket.receiveBufferSize = 2048
                 socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 4000)
                 connected = true
@@ -306,7 +305,6 @@ class PacketForwarder(
                             writeToTunSafe(outputStream, rstPkt)
                             break
                         }
-                        // إخضاع كل بايت وارد للفلتر دون أي استثناء
                         rateLimiter.acquire(read)
                         totalDownloadedBytes += read
                         totalBytesTransferred.addAndGet(read.toLong())
@@ -415,60 +413,4 @@ class PacketForwarder(
         val ipChecksum = computeChecksum(buf.array(), 0, 20)
         buf.putShort(10, ipChecksum)
 
-        buf.putShort(srcPort.toShort())
-        buf.putShort(dstPort.toShort())
-        buf.putInt(seq.toInt())
-        buf.putInt(ack.toInt())
-        buf.put(0x50.toByte())
-        buf.put(flags.toByte())
-        // نافذة TCP صغيرة (2048 بايت) لمنع ضخ البيانات دفعة واحدة
-        buf.putShort(2048.toShort())
-        buf.putShort(0)
-        buf.putShort(0)
-        buf.put(payload)
-
-        val tcpChecksum = computeTcpChecksum(srcIp, dstIp, buf.array(), 20, 20 + payload.size)
-        buf.putShort(36, tcpChecksum)
-
-        return buf.array()
-    }
-
-    private fun computeChecksum(data: ByteArray, offset: Int, length: Int): Short {
-        var sum = 0L
-        var i = offset
-        while (i < offset + length - 1) {
-            sum += ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
-            i += 2
-        }
-        if (length % 2 == 1) {
-            sum += (data[offset + length - 1].toInt() and 0xFF) shl 8
-        }
-        while ((sum shr 16) != 0L) {
-            sum = (sum and 0xFFFF) + (sum shr 16)
-        }
-        return (sum.inv() and 0xFFFF).toShort()
-    }
-
-    private fun computeTcpChecksum(srcIp: ByteArray, dstIp: ByteArray, data: ByteArray, tcpOffset: Int, tcpLength: Int): Short {
-        var sum = 0L
-        for (i in 0 until 4 step 2) {
-            sum += ((srcIp[i].toInt() and 0xFF) shl 8) or (srcIp[i + 1].toInt() and 0xFF)
-            sum += ((dstIp[i].toInt() and 0xFF) shl 8) or (dstIp[i + 1].toInt() and 0xFF)
-        }
-        sum += 6L
-        sum += tcpLength.toLong()
-
-        var i = tcpOffset
-        while (i < tcpOffset + tcpLength - 1) {
-            sum += ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
-            i += 2
-        }
-        if (tcpLength % 2 == 1) {
-            sum += (data[tcpOffset + tcpLength - 1].toInt() and 0xFF) shl 8
-        }
-        while ((sum shr 16) != 0L) {
-            sum = (sum and 0xFFFF) + (sum shr 16)
-        }
-        return (sum.inv() and 0xFFFF).toShort()
-    }
-}
+        buf.putShort
