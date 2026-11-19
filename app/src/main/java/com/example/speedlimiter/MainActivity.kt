@@ -72,7 +72,7 @@ class MainActivity : AppCompatActivity() {
 
         val prefs = getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
         val savedSpeed = prefs.getInt("speed_kb", 70)
-        val savedLimit = prefs.getInt("session_limit_kb", 250)
+        val savedLimit = prefs.getInt("session_limit_kb", 0)
         selectedSpeedPackages.addAll(prefs.getStringSet("selected_apps", emptySet()) ?: emptySet())
         selectedBgKillPackages.addAll(prefs.getStringSet("bg_kill_apps", emptySet()) ?: emptySet())
 
@@ -153,7 +153,9 @@ class MainActivity : AppCompatActivity() {
         }
         sessionCol.addView(TextView(this).apply { text = "حد الجلسة (KB):"; textSize = 13f; setTextColor(Color.LTGRAY) })
         sessionLimitInput = EditText(this).apply {
-            setText(savedLimit.toString())
+            hint = "بدون حد"
+            setHintTextColor(Color.GRAY)
+            if (savedLimit > 0) setText(savedLimit.toString())
             inputType = InputType.TYPE_CLASS_NUMBER
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor("#2A2A2A"))
@@ -334,15 +336,19 @@ class MainActivity : AppCompatActivity() {
         for (appInfo in packages) {
             if (appInfo.packageName == packageName) continue
 
+            // استبعاد أي تطبيق نظام بالكامل (سواء أساسي أو محدث) من الظهور أو التحديد
             val isSystemApp = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
             val isUpdatedSystemApp = (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
-
-            if (isSystemApp && !isUpdatedSystemApp) continue
+            if (isSystemApp || isUpdatedSystemApp) continue
 
             val label = pm.getApplicationLabel(appInfo).toString()
             val icon = pm.getApplicationIcon(appInfo)
             userApps.add(AppItem(label, appInfo.packageName, icon))
         }
+
+        val validUserPackages = userApps.map { it.packageName }.toSet()
+        selectedSpeedPackages.retainAll(validUserPackages)
+        selectedBgKillPackages.retainAll(validUserPackages)
 
         userApps.sortWith(compareByDescending<AppItem> { selectedSpeedPackages.contains(it.packageName) }.thenBy { it.name.lowercase() })
 
@@ -439,9 +445,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun getSessionLimitValue(): Int {
+        val raw = sessionLimitInput.text.toString().trim()
+        if (raw.isEmpty()) return 0
+        return raw.toIntOrNull() ?: 0
+    }
+
     private fun savePreferences() {
         val speedKb = speedInput.text.toString().toIntOrNull() ?: 70
-        val sessionLimitKb = sessionLimitInput.text.toString().toIntOrNull() ?: 250
+        val sessionLimitKb = getSessionLimitValue()
 
         getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE).edit()
             .putInt("speed_kb", speedKb)
@@ -467,7 +479,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun startVpnService() {
         val speedKb = speedInput.text.toString().toIntOrNull() ?: 70
-        val sessionLimitKb = sessionLimitInput.text.toString().toIntOrNull() ?: 250
+        val sessionLimitKb = getSessionLimitValue()
         savePreferences()
 
         val intent = Intent(this, MyVpnService::class.java).apply {
