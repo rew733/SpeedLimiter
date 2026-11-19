@@ -91,18 +91,20 @@ class PacketForwarder(
     }
 
     private fun isUidBlockedInBackground(uid: Int): Boolean {
-        if (uid <= 0 || !bgBlockedUids.contains(uid)) return false
+        if (uid <= 0) return false
+        // إذا كان التطبيق في قائمة تحديد السرعة، نسمح بمرور بياناته (مقيدة بالسرعة) ولا نحظره كلياً
+        if (speedLimitedUids.contains(uid)) return false
+        if (!bgBlockedUids.contains(uid)) return false
+        // إذا كان التطبيق مفتوحاً حالياً في الواجهة، يُسمح له بالإنترنت
         if (currentForegroundUid == uid) return false
         return true
     }
 
     private fun isUidSpeedLimited(uid: Int): Boolean {
         if (speedLimitedUids.isEmpty()) return false
-        // إذا كان التطبيق في الواجهة غير مشمول بقائمة تحديد السرعة وموجود فقط في قائمة حظر الخلفية، لا نبطئ سرعته
         if (uid > 10000 && !speedLimitedUids.contains(uid) && bgBlockedUids.contains(uid)) {
             return false
         }
-        // تطبيق تحديد السرعة على جميع الحزم المارة في النفق لضمان عدم تخطي الحد بسبب دقة النظام في كشف UID
         return true
     }
 
@@ -136,19 +138,22 @@ class PacketForwarder(
 
         if (dstPort == 443) return
 
-        val ownerUid = resolveOwnerUid(OsConstants.IPPROTO_UDP, srcIp, srcPort, dstIp, dstPort)
-        if (isUidBlockedInBackground(ownerUid)) return
-
         val payloadOffset = ipHeaderLen + 8
         val payloadLen = rawPacket.size - payloadOffset
         if (payloadLen <= 0) return
         val payload = rawPacket.copyOfRange(payloadOffset, rawPacket.size)
 
+        // السماح دائماً باستعلامات DNS حتى لا يتعطل كشف النطاقات
         if (dstPort == 53 && isDnsAaaaQuery(payload)) {
             val emptyDnsResponse = buildEmptyDnsResponse(payload)
             val ipResponse = buildUdpIpPacket(dstIp, dstPort, srcIp, srcPort, emptyDnsResponse)
             writeToTunSafe(outputStream, ipResponse)
             return
+        }
+
+        if (dstPort != 53) {
+            val ownerUid = resolveOwnerUid(OsConstants.IPPROTO_UDP, srcIp, srcPort, dstIp, dstPort)
+            if (isUidBlockedInBackground(ownerUid)) return
         }
 
         executor.execute {
@@ -251,13 +256,7 @@ class PacketForwarder(
         val fin = (flags and 0x01) != 0
         val rst = (flags and 0x04) != 0
 
-        val ownerUid = resolveOwnerUid(OsConstants.IPPROTO_TCP, srcIp, srcPort, dstIp, dstPort)
         val sessionKey = "${InetAddress.getByAddress(srcIp).hostAddress}:$srcPort-${InetAddress.getByAddress(dstIp).hostAddress}:$dstPort"
-
-        if (isUidBlockedInBackground(ownerUid)) {
-            tcpSessions.remove(sessionKey)?.close()
-            return
-        }
 
         val payloadOffset = ipHeaderLen + tcpHeaderLen
         val payload = if (rawPacket.size > payloadOffset) {
@@ -272,6 +271,11 @@ class PacketForwarder(
         }
 
         if (syn && !ack) {
+            val ownerUid = resolveOwnerUid(OsConstants.IPPROTO_TCP, srcIp, srcPort, dstIp, dstPort)
+            if (isUidBlockedInBackground(ownerUid)) {
+                tcpSessions.remove(sessionKey)?.close()
+                return
+            }
             tcpSessions.remove(sessionKey)?.close()
             val applyLimit = isUidSpeedLimited(ownerUid)
             val session = TcpSession(sessionKey, srcIp, srcPort, dstIp, dstPort, seqNum, outputStream, ownerUid, applyLimit)
@@ -281,12 +285,6 @@ class PacketForwarder(
         }
 
         val session = tcpSessions[sessionKey] ?: return
-        if (isUidBlockedInBackground(session.ownerUid)) {
-            session.close()
-            tcpSessions.remove(sessionKey)
-            return
-        }
-
         session.lastActivityTime = System.currentTimeMillis()
 
         if (fin) {
@@ -335,9 +333,6 @@ class PacketForwarder(
                 val inStream = socket.getInputStream()
                 val buffer = ByteArray(1200)
                 while (running && connected && !socket.isClosed) {
-                    if (isUidBlockedInBackground(ownerUid)) {
-                        break
-                    }
                     val read = inStream.read(buffer)
                     lastActivityTime = System.currentTimeMillis()
                     if (read == -1) {
