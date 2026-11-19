@@ -62,7 +62,6 @@ class PacketForwarder(
         }
     }
 
-    // تنظيف فوري للجلسات المتراكمة دون إيقاف النفق أو تصفير العداد
     fun refreshSessions() {
         val it = tcpSessions.entries.iterator()
         while (it.hasNext()) {
@@ -275,10 +274,13 @@ class PacketForwarder(
 
         fun connect() {
             try {
+                // تقييد تدفق فتح الاتصالات المتزامنة لمنع قفزات السرعة
+                rateLimiter.acquire(1024)
                 vpnService.protect(socket)
                 socket.tcpNoDelay = true
                 socket.soTimeout = 15000
-                socket.receiveBufferSize = 8192
+                // تقليص ذاكرة الاستقبال قبل الاتصال للتحكم في نافذة الخادم
+                socket.receiveBufferSize = 2048
                 socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 4000)
                 connected = true
                 lastActivityTime = System.currentTimeMillis()
@@ -288,7 +290,7 @@ class PacketForwarder(
                 writeToTunSafe(outputStream, synAck)
 
                 val inStream = socket.getInputStream()
-                val buffer = ByteArray(1200)
+                val buffer = ByteArray(1024)
                 while (running && connected && !socket.isClosed) {
                     val read = inStream.read(buffer)
                     lastActivityTime = System.currentTimeMillis()
@@ -304,9 +306,8 @@ class PacketForwarder(
                             writeToTunSafe(outputStream, rstPkt)
                             break
                         }
-                        if (read > 160) {
-                            rateLimiter.acquire(read)
-                        }
+                        // إخضاع كل بايت وارد للفلتر دون أي استثناء
+                        rateLimiter.acquire(read)
                         totalDownloadedBytes += read
                         totalBytesTransferred.addAndGet(read.toLong())
                         val chunk = buffer.copyOf(read)
@@ -328,6 +329,7 @@ class PacketForwarder(
             try {
                 lastActivityTime = System.currentTimeMillis()
                 if (seq == clientNextSeq) {
+                    rateLimiter.acquire(data.size)
                     clientNextSeq = (seq + data.size) and 0xFFFFFFFFL
                     socket.getOutputStream().write(data)
                     socket.getOutputStream().flush()
@@ -419,7 +421,8 @@ class PacketForwarder(
         buf.putInt(ack.toInt())
         buf.put(0x50.toByte())
         buf.put(flags.toByte())
-        buf.putShort(8192.toShort())
+        // نافذة TCP صغيرة (2048 بايت) لمنع ضخ البيانات دفعة واحدة
+        buf.putShort(2048.toShort())
         buf.putShort(0)
         buf.putShort(0)
         buf.put(payload)
