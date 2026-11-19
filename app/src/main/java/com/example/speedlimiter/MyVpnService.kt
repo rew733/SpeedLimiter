@@ -45,8 +45,12 @@ class MyVpnService : VpnService() {
                 stopVpn()
                 return START_NOT_STICKY
             }
-            "BOOST_30S" -> {
+            "BOOST_3M" -> {
                 activateBoost()
+                return START_STICKY
+            }
+            "STOP_BOOST" -> {
+                stopBoost()
                 return START_STICKY
             }
         }
@@ -59,8 +63,8 @@ class MyVpnService : VpnService() {
 
         val speedKb = intent?.getIntExtra("SPEED_KB", prefs.getInt("speed_kb", 70))
             ?: prefs.getInt("speed_kb", 70)
-        val sessionLimitKb = intent?.getIntExtra("SESSION_LIMIT_KB", prefs.getInt("session_limit_kb", 250))
-            ?: prefs.getInt("session_limit_kb", 250)
+        val sessionLimitKb = intent?.getIntExtra("SESSION_LIMIT_KB", prefs.getInt("session_limit_kb", 0))
+            ?: prefs.getInt("session_limit_kb", 0)
 
         currentLimitKb = speedKb
         savedBgKillPackages = bgKillPackages
@@ -76,7 +80,6 @@ class MyVpnService : VpnService() {
         return START_REDELIVER_INTENT
     }
 
-    // تحديث تلقائي كل 10 دقائق لمنع تراكم الأوامر والجلسات العالقة وتنظيف تطبيقات الخلفية
     private fun startAutoRefreshTimer() {
         stopAutoRefreshTimer()
         autoRefreshExecutor = Executors.newSingleThreadScheduledExecutor()
@@ -97,8 +100,24 @@ class MyVpnService : VpnService() {
 
     private fun activateBoost() {
         if (!isServiceRunning) return
-        boostEndTimeMillis = System.currentTimeMillis() + 30_000L
+        boostEndTimeMillis = System.currentTimeMillis() + 180_000L
         rateLimiter?.setBoost(true)
+        refreshNotificationNow()
+    }
+
+    private fun stopBoost() {
+        boostEndTimeMillis = 0L
+        rateLimiter?.setBoost(false)
+        refreshNotificationNow()
+    }
+
+    private fun refreshNotificationNow() {
+        if (!isServiceRunning) return
+        val now = System.currentTimeMillis()
+        val remainingSec = if (boostEndTimeMillis > now) ((boostEndTimeMillis - now) / 1000L).toInt() + 1 else 0
+        val totalUsedMb = (packetForwarder?.totalBytesTransferred?.get() ?: 0L) / (1024.0 * 1024.0)
+        val manager = getSystemService(NotificationManager::class.java)
+        manager?.notify(1, buildNotification(0.0, totalUsedMb, remainingSec))
     }
 
     private fun startLiveMonitor() {
@@ -244,8 +263,12 @@ class MyVpnService : VpnService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        val boostIntent = PendingIntent.getService(
-            this, 1, Intent(this, MyVpnService::class.java).apply { action = "BOOST_30S" },
+        val boostActionIntent = PendingIntent.getService(
+            this,
+            1,
+            Intent(this, MyVpnService::class.java).apply {
+                action = if (boostRemainingSec > 0) "STOP_BOOST" else "BOOST_3M"
+            },
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
@@ -255,7 +278,9 @@ class MyVpnService : VpnService() {
         )
 
         val title = if (boostRemainingSec > 0) {
-            "🚀 تعزيز السرعة نشط (${boostRemainingSec}ث)"
+            val mins = boostRemainingSec / 60
+            val secs = boostRemainingSec % 60
+            String.format(Locale.US, "🚀 التعزيز نشط (%02d:%02d) - %.1f KB/s", mins, secs, liveSpeedKb)
         } else {
             String.format(Locale.US, "السرعة: %.1f KB/s (الحد: %d KB/s)", liveSpeedKb, currentLimitKb)
         }
@@ -270,9 +295,9 @@ class MyVpnService : VpnService() {
         }
 
         val boostAction = Notification.Action.Builder(
-            android.R.drawable.ic_media_ff,
-            if (boostRemainingSec > 0) "تمديد 30ث" else "🚀 تعزيز 30ث",
-            boostIntent
+            if (boostRemainingSec > 0) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_ff,
+            if (boostRemainingSec > 0) "🛑 إيقاف التعزيز" else "🚀 تعزيز 3د",
+            boostActionIntent
         ).build()
 
         val stopAction = Notification.Action.Builder(
