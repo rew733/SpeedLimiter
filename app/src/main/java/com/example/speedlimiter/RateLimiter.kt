@@ -1,56 +1,40 @@
 package com.example.speedlimiter
 
-class RateLimiter(initialBytesPerSecond: Long) {
-    @Volatile
-    var bytesPerSecond: Long = initialBytesPerSecond
-        private set
+class RateLimiter(private val bytesPerSecond: Long) {
 
     @Volatile
     var isBoostActive: Boolean = false
         private set
 
-    private var availableTokens: Double = initialBytesPerSecond.toDouble()
-    private var lastRefillTime: Long = System.nanoTime()
+    private var nextAllowedTimeNanos: Long = System.nanoTime()
 
-    @Synchronized
-    fun updateSpeed(newBytesPerSecond: Long) {
-        bytesPerSecond = newBytesPerSecond
-        if (availableTokens > newBytesPerSecond) {
-            availableTokens = newBytesPerSecond.toDouble()
-        }
-    }
-
-    @Synchronized
     fun setBoost(active: Boolean) {
         isBoostActive = active
     }
 
     fun acquire(bytes: Int) {
-        if (isBoostActive || bytesPerSecond <= 0L) return
+        if (isBoostActive || bytesPerSecond <= 0L || bytes <= 0) return
 
-        var waitMillis = 0L
+        val waitNanos: Long
         synchronized(this) {
             val now = System.nanoTime()
-            val elapsedSeconds = (now - lastRefillTime) / 1_000_000_000.0
-            if (elapsedSeconds > 0) {
-                availableTokens = (availableTokens + elapsedSeconds * bytesPerSecond)
-                    .coerceAtMost(bytesPerSecond.toDouble())
-                lastRefillTime = now
+            // منع تراكم رصيد قديم (Burst) لأكثر من 40 مللي ثانية
+            val minAllowed = now - 40_000_000L
+            if (nextAllowedTimeNanos < minAllowed) {
+                nextAllowedTimeNanos = minAllowed
             }
 
-            if (availableTokens >= bytes) {
-                availableTokens -= bytes
-            } else {
-                val deficit = bytes - availableTokens
-                waitMillis = ((deficit / bytesPerSecond) * 1000.0).toLong()
-                availableTokens = 0.0
-                lastRefillTime = now + (waitMillis * 1_000_000L)
-            }
+            val durationNanos = (bytes.toLong() * 1_000_000_000L) / bytesPerSecond
+            val scheduledTime = nextAllowedTimeNanos
+            nextAllowedTimeNanos += durationNanos
+            waitNanos = scheduledTime - now
         }
 
-        if (waitMillis > 0) {
+        if (waitNanos > 0L) {
             try {
-                Thread.sleep(waitMillis)
+                val millis = waitNanos / 1_000_000L
+                val nanos = (waitNanos % 1_000_000L).toInt()
+                Thread.sleep(millis, nanos)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
