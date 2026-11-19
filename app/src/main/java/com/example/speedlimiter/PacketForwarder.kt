@@ -26,7 +26,6 @@ class PacketForwarder(
     private val speedLimitedUids: Set<Int> = emptySet(),
     private val bgBlockedUids: Set<Int> = emptySet()
 ) {
-    // فصل خيوط DNS/UDP عن خيوط TCP واستخدام CachedThreadPool لمنع اختناق النفق وتجمده
     private val udpExecutor = Executors.newCachedThreadPool()
     private val tcpExecutor = Executors.newCachedThreadPool()
     private val cleaner: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
@@ -34,7 +33,8 @@ class PacketForwarder(
     private val connectivityManager = vpnService.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
     @Volatile private var running = false
-    @Volatile var currentForegroundUid: Int = -1
+    // مجموعة الـ UIDs المسموح لها بالعمل حالياً (التطبيق المفتوح + الخدمات والتطبيقات المرتبطة به)
+    @Volatile var allowedActiveUids: Set<Int> = emptySet()
 
     val totalBytesTransferred = AtomicLong(0L)
 
@@ -97,7 +97,11 @@ class PacketForwarder(
         if (uid <= 0) return false
         if (speedLimitedUids.contains(uid)) return false
         if (!bgBlockedUids.contains(uid)) return false
-        if (currentForegroundUid == uid) return false
+        // إذا لم يُحدد النظام التطبيق النشط بعد، لا نحظر لتجنب انقطاع الاتصال
+        val activeSet = allowedActiveUids
+        if (activeSet.isEmpty()) return false
+        // تجاوز الحظر للتطبيق المفتوح وأي خدمة أو تطبيق مرتبط به
+        if (activeSet.contains(uid)) return false
         return true
     }
 
