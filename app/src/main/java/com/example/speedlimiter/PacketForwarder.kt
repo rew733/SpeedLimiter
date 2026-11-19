@@ -26,7 +26,9 @@ class PacketForwarder(
     private val speedLimitedUids: Set<Int> = emptySet(),
     private val bgBlockedUids: Set<Int> = emptySet()
 ) {
-    private val executor = Executors.newFixedThreadPool(36)
+    // فصل خيوط DNS/UDP عن خيوط TCP واستخدام CachedThreadPool لمنع اختناق النفق وتجمده
+    private val udpExecutor = Executors.newCachedThreadPool()
+    private val tcpExecutor = Executors.newCachedThreadPool()
     private val cleaner: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
     private val tcpSessions = ConcurrentHashMap<String, TcpSession>()
     private val connectivityManager = vpnService.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -76,7 +78,8 @@ class PacketForwarder(
         try { cleaner.shutdownNow() } catch (_: Exception) {}
         tcpSessions.values.forEach { it.close() }
         tcpSessions.clear()
-        try { executor.shutdownNow() } catch (_: Exception) {}
+        try { udpExecutor.shutdownNow() } catch (_: Exception) {}
+        try { tcpExecutor.shutdownNow() } catch (_: Exception) {}
     }
 
     private fun resolveOwnerUid(protocol: Int, srcIp: ByteArray, srcPort: Int, dstIp: ByteArray, dstPort: Int): Int {
@@ -92,10 +95,8 @@ class PacketForwarder(
 
     private fun isUidBlockedInBackground(uid: Int): Boolean {
         if (uid <= 0) return false
-        // إذا كان التطبيق في قائمة تحديد السرعة، نسمح بمرور بياناته (مقيدة بالسرعة) ولا نحظره كلياً
         if (speedLimitedUids.contains(uid)) return false
         if (!bgBlockedUids.contains(uid)) return false
-        // إذا كان التطبيق مفتوحاً حالياً في الواجهة، يُسمح له بالإنترنت
         if (currentForegroundUid == uid) return false
         return true
     }
@@ -143,7 +144,6 @@ class PacketForwarder(
         if (payloadLen <= 0) return
         val payload = rawPacket.copyOfRange(payloadOffset, rawPacket.size)
 
-        // السماح دائماً باستعلامات DNS حتى لا يتعطل كشف النطاقات
         if (dstPort == 53 && isDnsAaaaQuery(payload)) {
             val emptyDnsResponse = buildEmptyDnsResponse(payload)
             val ipResponse = buildUdpIpPacket(dstIp, dstPort, srcIp, srcPort, emptyDnsResponse)
@@ -156,7 +156,7 @@ class PacketForwarder(
             if (isUidBlockedInBackground(ownerUid)) return
         }
 
-        executor.execute {
+        udpExecutor.execute {
             var socket: DatagramSocket? = null
             try {
                 socket = DatagramSocket()
@@ -280,7 +280,7 @@ class PacketForwarder(
             val applyLimit = isUidSpeedLimited(ownerUid)
             val session = TcpSession(sessionKey, srcIp, srcPort, dstIp, dstPort, seqNum, outputStream, ownerUid, applyLimit)
             tcpSessions[sessionKey] = session
-            executor.execute { session.connect() }
+            tcpExecutor.execute { session.connect() }
             return
         }
 
