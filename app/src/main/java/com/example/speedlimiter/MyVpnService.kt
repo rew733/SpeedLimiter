@@ -9,6 +9,7 @@ import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
@@ -17,6 +18,7 @@ import android.os.PowerManager
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
@@ -35,6 +37,8 @@ class MyVpnService : VpnService() {
     private var lastBytesSnapshot: Long = 0L
     private var boostEndTimeMillis: Long = 0L
     private var lastKnownForegroundPkg: String? = null
+    private var currentBgKillPackages: List<String> = emptyList()
+    private val dependencyCache = ConcurrentHashMap<String, Set<Int>>()
 
     companion object {
         @Volatile
@@ -65,6 +69,8 @@ class MyVpnService : VpnService() {
             ?: prefs.getInt("session_limit_kb", 250)
 
         currentLimitKb = speedKb
+        currentBgKillPackages = bgKillPackages
+        dependencyCache.clear()
         killBackgroundProcesses(bgKillPackages)
 
         cleanupTunnel()
@@ -92,20 +98,70 @@ class MyVpnService : VpnService() {
                 val fgPkg = getForegroundPackageName()
                 if (fgPkg != null && fgPkg != lastKnownForegroundPkg) {
                     lastKnownForegroundPkg = fgPkg
-                    val uid = try {
-                        packageManager.getApplicationInfo(fgPkg, 0).uid
-                    } catch (_: Exception) { -1 }
-                    packetForwarder?.currentForegroundUid = uid
+                    packetForwarder?.allowedActiveUids = resolveActiveGroupUids(fgPkg)
                 }
             } catch (_: Exception) {}
         }, 0, 500, TimeUnit.MILLISECONDS)
+    }
+
+    private fun resolveActiveGroupUids(fgPkg: String): Set<Int> {
+        dependencyCache[fgPkg]?.let { return it }
+
+        val allowed = mutableSetOf<Int>()
+        addUidIfValid(fgPkg, allowed)
+
+        // 1. السماح تلقائياً لأي تطبيق أو خدمة تحمل نفس التوقيع البرمجي لمطوّر التطبيق المفتوح
+        for (pkg in currentBgKillPackages) {
+            try {
+                @Suppress("DEPRECATION")
+                if (packageManager.checkSignatures(fgPkg, pkg) == PackageManager.SIGNATURE_MATCH) {
+                    addUidIfValid(pkg, allowed)
+                }
+            } catch (_: Exception) {}
+        }
+
+        // 2. خريطة التبعيات الذكية للتطبيقات التي تعتمد على خدمات خلفية مستقلة
+        if (fgPkg.startsWith("com.google.") || fgPkg == "com.android.chrome" || fgPkg == "com.android.vending") {
+            listOf(
+                "com.google.android.googlequicksearchbox",
+                "com.google.android.gms",
+                "com.google.android.gsf",
+                "com.google.android.apps.bard",
+                "com.google.android.webview",
+                "com.android.chrome"
+            ).forEach { addUidIfValid(it, allowed) }
+        }
+
+        if (fgPkg.startsWith("com.facebook.") || fgPkg.startsWith("com.instagram.") || fgPkg.startsWith("com.whatsapp")) {
+            listOf(
+                "com.facebook.services",
+                "com.facebook.system",
+                "com.facebook.appmanager"
+            ).forEach { addUidIfValid(it, allowed) }
+        }
+
+        // 3. خدمات مساعدة عامة يحتاجها أي تطبيق مفتوح (WebView + مدير التنزيلات)
+        listOf(
+            "com.google.android.webview",
+            "com.android.providers.downloads"
+        ).forEach { addUidIfValid(it, allowed) }
+
+        val result = allowed.toSet()
+        dependencyCache[fgPkg] = result
+        return result
+    }
+
+    private fun addUidIfValid(pkg: String, target: MutableSet<Int>) {
+        try {
+            val uid = packageManager.getApplicationInfo(pkg, 0).uid
+            if (uid > 0) target.add(uid)
+        } catch (_: Exception) {}
     }
 
     private fun getForegroundPackageName(): String? {
         try {
             val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
             val now = System.currentTimeMillis()
-            // البحث في آخر 60 ثانية لضمان عدم فقدان التطبيق المفتوح أثناء القراءة أو المشاهدة
             val events = usm.queryEvents(now - 60_000L, now)
             val event = UsageEvents.Event()
             var latestPkg: String? = lastKnownForegroundPkg
@@ -115,7 +171,11 @@ class MyVpnService : VpnService() {
                     latestPkg = event.packageName
                 }
             }
-            return latestPkg
+            if (latestPkg != null) return latestPkg
+
+            // خيار احتياطي إذا لم يُسجّل حدث حديث في آخر دقيقة
+            val stats = usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, now - 3_600_000L, now)
+            return stats?.maxByOrNull { it.lastTimeUsed }?.packageName
         } catch (_: Exception) {
             return lastKnownForegroundPkg
         }
@@ -206,7 +266,6 @@ class MyVpnService : VpnService() {
         val maxSessionBytes = if (sessionLimitKb > 0) sessionLimitKb.toLong() * 1024L else Long.MAX_VALUE
         packetForwarder = PacketForwarder(this, limiter, maxSessionBytes, speedUids, bgBlockedUids)
 
-        // إبقاء IPv6 في النفق لالتقاط استعلامات AAAA وتحويلها فوراً إلى IPv4 داخل PacketForwarder
         val builder = Builder()
             .setSession("SpeedLimiter")
             .addAddress("10.0.0.2", 32)
