@@ -105,7 +105,8 @@ class MyVpnService : VpnService() {
         try {
             val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
             val now = System.currentTimeMillis()
-            val events = usm.queryEvents(now - 10_000L, now)
+            // البحث في آخر 60 ثانية لضمان عدم فقدان التطبيق المفتوح أثناء القراءة أو المشاهدة
+            val events = usm.queryEvents(now - 60_000L, now)
             val event = UsageEvents.Event()
             var latestPkg: String? = lastKnownForegroundPkg
             while (events.hasNextEvent()) {
@@ -205,11 +206,13 @@ class MyVpnService : VpnService() {
         val maxSessionBytes = if (sessionLimitKb > 0) sessionLimitKb.toLong() * 1024L else Long.MAX_VALUE
         packetForwarder = PacketForwarder(this, limiter, maxSessionBytes, speedUids, bgBlockedUids)
 
-        // استخدام IPv4 فقط لإجبار جميع التطبيقات على المرور عبر محرك التقييد دون تسرب IPv6
+        // إبقاء IPv6 في النفق لالتقاط استعلامات AAAA وتحويلها فوراً إلى IPv4 داخل PacketForwarder
         val builder = Builder()
             .setSession("SpeedLimiter")
             .addAddress("10.0.0.2", 32)
             .addRoute("0.0.0.0", 0)
+            .addAddress("fd00:1:fd00:1:fd00:1:fd00:1", 128)
+            .addRoute("::", 0)
             .addDnsServer("8.8.8.8")
             .addDnsServer("1.1.1.1")
             .setMtu(1400)
