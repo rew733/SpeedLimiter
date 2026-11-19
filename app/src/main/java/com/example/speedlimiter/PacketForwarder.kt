@@ -106,7 +106,6 @@ class PacketForwarder(
         val srcPort = ((rawPacket[ipHeaderLen].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 1].toInt() and 0xFF)
         val dstPort = ((rawPacket[ipHeaderLen + 2].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 3].toInt() and 0xFF)
 
-        // السماح بمنفذ DNS (53) فقط وإسقاط بقية منافذ UDP لإجبار البث المباشر على المرور عبر TCP المقيّد
         if (dstPort != 53) return
 
         val payloadOffset = ipHeaderLen + 8
@@ -413,4 +412,59 @@ class PacketForwarder(
         val ipChecksum = computeChecksum(buf.array(), 0, 20)
         buf.putShort(10, ipChecksum)
 
-        buf.putShort
+        buf.putShort(srcPort.toShort())
+        buf.putShort(dstPort.toShort())
+        buf.putInt(seq.toInt())
+        buf.putInt(ack.toInt())
+        buf.put(0x50.toByte())
+        buf.put(flags.toByte())
+        buf.putShort(2048.toShort())
+        buf.putShort(0)
+        buf.putShort(0)
+        buf.put(payload)
+
+        val tcpChecksum = computeTcpChecksum(srcIp, dstIp, buf.array(), 20, 20 + payload.size)
+        buf.putShort(36, tcpChecksum)
+
+        return buf.array()
+    }
+
+    private fun computeChecksum(data: ByteArray, offset: Int, length: Int): Short {
+        var sum = 0L
+        var i = offset
+        while (i < offset + length - 1) {
+            sum += ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
+            i += 2
+        }
+        if (length % 2 == 1) {
+            sum += (data[offset + length - 1].toInt() and 0xFF) shl 8
+        }
+        while ((sum shr 16) != 0L) {
+            sum = (sum and 0xFFFF) + (sum shr 16)
+        }
+        return (sum.inv() and 0xFFFF).toShort()
+    }
+
+    private fun computeTcpChecksum(srcIp: ByteArray, dstIp: ByteArray, data: ByteArray, tcpOffset: Int, tcpLength: Int): Short {
+        var sum = 0L
+        for (i in 0 until 4 step 2) {
+            sum += ((srcIp[i].toInt() and 0xFF) shl 8) or (srcIp[i + 1].toInt() and 0xFF)
+            sum += ((dstIp[i].toInt() and 0xFF) shl 8) or (dstIp[i + 1].toInt() and 0xFF)
+        }
+        sum += 6L
+        sum += tcpLength.toLong()
+
+        var i = tcpOffset
+        while (i < tcpOffset + tcpLength - 1) {
+            sum += ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
+            i += 2
+        }
+        if (tcpLength % 2 == 1) {
+            sum += (data[tcpOffset + tcpLength - 1].toInt() and 0xFF) shl 8
+        }
+        while ((sum shr 16) != 0L) {
+            sum = (sum and 0xFFFF) + (sum shr 16)
+        }
+        return (sum.inv() and 0xFFFF).toShort()
+    }
+}
