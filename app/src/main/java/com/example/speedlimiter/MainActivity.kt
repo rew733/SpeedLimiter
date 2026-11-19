@@ -2,6 +2,7 @@ package com.example.speedlimiter
 
 import android.Manifest
 import android.app.Activity
+import android.app.AppOpsManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
@@ -11,6 +12,8 @@ import android.graphics.drawable.Drawable
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.os.Process
+import android.provider.Settings
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
@@ -63,7 +66,6 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // طلب إذن الإشعارات تلقائياً في أندرويد 13 و14 لإظهار عداد السرعة وزر التعزيز
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                 ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101)
@@ -83,7 +85,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val titleText = TextView(this).apply {
-            text = "مُحدّد السرعة وحظر الخلفية"
+            text = "مُحدّد السرعة وحظر الخلفية الذكي"
             textSize = 18f
             setTextColor(Color.WHITE)
             setPadding(0, 0, 0, 16)
@@ -214,7 +216,7 @@ class MainActivity : AppCompatActivity() {
         speedLayoutContainer.addView(speedListView)
         rootLayout.addView(speedLayoutContainer)
 
-        // تبويب حظر الخلفية
+        // تبويب حظر الخلفية الذكي
         bgLayoutContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
@@ -253,7 +255,7 @@ class MainActivity : AppCompatActivity() {
         bgLayoutContainer.addView(bgHeaderRow)
 
         val bgInfoText = TextView(this).apply {
-            text = "التطبيقات المحددة هنا سيتم منع نشاطها في الخلفية تلقائياً (تطبيقات النظام مستثناة بالكامل لحماية النظام)."
+            text = "ينقطع الإنترنت (0 KB/s) عن هذه التطبيقات في الخلفية فقط، ويعود تلقائياً بمجرد فتحها (تطبيقات النظام مستثناة)."
             textSize = 11f
             setTextColor(Color.parseColor("#B0BEC5"))
             setPadding(0, 0, 0, 8)
@@ -300,7 +302,22 @@ class MainActivity : AppCompatActivity() {
             bgLayoutContainer.visibility = View.VISIBLE
             tabSpeedBtn.setBackgroundColor(Color.parseColor("#2A2A2A"))
             tabBgBtn.setBackgroundColor(Color.parseColor("#D50000"))
+            if (!hasUsageStatsPermission()) {
+                Toast.makeText(this, "فعّل إذن 'الوصول إلى بيانات الاستخدام' لتمييز التطبيق المفتوح تلقائياً", Toast.LENGTH_LONG).show()
+                startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+            }
         }
+    }
+
+    private fun hasUsageStatsPermission(): Boolean {
+        val appOps = getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            appOps.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), packageName)
+        } else {
+            @Suppress("DEPRECATION")
+            appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), packageName)
+        }
+        return mode == AppOpsManager.MODE_ALLOWED
     }
 
     private fun loadInstalledApps() {
@@ -404,6 +421,11 @@ class MainActivity : AppCompatActivity() {
     private fun prepareAndStartVpn() {
         if (selectedSpeedPackages.isEmpty() && selectedBgKillPackages.isEmpty()) {
             Toast.makeText(this, "اختر تطبيقاً واحداً على الأقل في أي من القائمتين", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (selectedBgKillPackages.isNotEmpty() && !hasUsageStatsPermission()) {
+            Toast.makeText(this, "يجب تفعيل إذن الوصول إلى بيانات الاستخدام أولاً لعمل الحظر الذكي", Toast.LENGTH_LONG).show()
+            startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
             return
         }
         savePreferences()
