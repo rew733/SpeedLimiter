@@ -166,6 +166,41 @@ class MainActivity : AppCompatActivity() {
         controlsRow.addView(sessionCol)
         speedLayoutContainer.addView(controlsRow)
 
+        // أزرار الاختيار السريع لخفض جودة الفيديو بلمسة واحدة
+        val presetsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 0, 0, 12)
+        }
+
+        val presets = listOf(
+            "📉 توفير أقصى (35)" to 35,
+            "🎬 جودة منخفضة (60)" to 60,
+            "📺 جودة متوسطة (110)" to 110
+        )
+
+        for ((label, kbValue) in presets) {
+            val presetBtn = Button(this).apply {
+                text = label
+                textSize = 11f
+                setTextColor(Color.WHITE)
+                setBackgroundColor(Color.parseColor("#263238"))
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    setMargins(4, 0, 4, 0)
+                }
+                setOnClickListener {
+                    speedInput.setText(kbValue.toString())
+                    if (MyVpnService.isServiceRunning) {
+                        prepareAndStartVpn()
+                    } else {
+                        savePreferences()
+                    }
+                    Toast.makeText(this@MainActivity, "تم ضبط السرعة على $kbValue KB/s", Toast.LENGTH_SHORT).show()
+                }
+            }
+            presetsRow.addView(presetBtn)
+        }
+        speedLayoutContainer.addView(presetsRow)
+
         val buttonsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, 0, 0, 12)
