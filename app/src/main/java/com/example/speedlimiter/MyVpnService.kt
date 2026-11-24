@@ -53,6 +53,10 @@ class MyVpnService : VpnService() {
                 stopBoost()
                 return START_STICKY
             }
+            "MANUAL_REFRESH" -> {
+                performInternalRefresh()
+                return START_STICKY
+            }
         }
 
         val prefs = getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
@@ -80,17 +84,22 @@ class MyVpnService : VpnService() {
         return START_REDELIVER_INTENT
     }
 
+    private fun performInternalRefresh() {
+        if (!isServiceRunning) return
+        try {
+            packetForwarder?.refreshSessions()
+            killBackgroundProcesses(savedBgKillPackages)
+            System.gc()
+            refreshNotificationNow()
+        } catch (_: Exception) {}
+    }
+
     private fun startAutoRefreshTimer() {
         stopAutoRefreshTimer()
         autoRefreshExecutor = Executors.newSingleThreadScheduledExecutor()
         autoRefreshExecutor?.scheduleWithFixedDelay({
-            if (!isServiceRunning) return@scheduleWithFixedDelay
-            try {
-                packetForwarder?.refreshSessions()
-                killBackgroundProcesses(savedBgKillPackages)
-                System.gc()
-            } catch (_: Exception) {}
-        }, 10, 10, TimeUnit.MINUTES)
+            performInternalRefresh()
+        }, 3, 3, TimeUnit.MINUTES)
     }
 
     private fun stopAutoRefreshTimer() {
@@ -277,6 +286,13 @@ class MyVpnService : VpnService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
+        val refreshIntent = PendingIntent.getService(
+            this,
+            3,
+            Intent(this, MyVpnService::class.java).apply { action = "MANUAL_REFRESH" },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
         val title = if (boostRemainingSec > 0) {
             val mins = boostRemainingSec / 60
             val secs = boostRemainingSec % 60
@@ -306,6 +322,12 @@ class MyVpnService : VpnService() {
             stopBoostIntent
         ).build()
 
+        val refreshAction = Notification.Action.Builder(
+            android.R.drawable.ic_popup_sync,
+            "🔄 تحديث",
+            refreshIntent
+        ).build()
+
         return builder
             .setContentTitle(title)
             .setContentText(content)
@@ -315,6 +337,7 @@ class MyVpnService : VpnService() {
             .setOnlyAlertOnce(true)
             .addAction(boostAction)
             .addAction(stopBoostAction)
+            .addAction(refreshAction)
             .build()
     }
 
