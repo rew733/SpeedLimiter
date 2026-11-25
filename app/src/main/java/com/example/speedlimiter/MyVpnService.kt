@@ -142,10 +142,6 @@ class MyVpnService : VpnService() {
                 val fgPkg = getForegroundPackageName()
                 if (fgPkg != null && fgPkg != lastKnownForegroundPkg) {
                     lastKnownForegroundPkg = fgPkg
-                    val uid = try {
-                        packageManager.getApplicationInfo(fgPkg, 0).uid
-                    } catch (_: Exception) { -1 }
-                    packetForwarder?.currentForegroundUid = uid
                 }
             } catch (_: Exception) {}
         }, 0, 500, TimeUnit.MILLISECONDS)
