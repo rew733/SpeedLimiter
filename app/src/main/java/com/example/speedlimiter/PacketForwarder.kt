@@ -31,7 +31,6 @@ class PacketForwarder(
     private val cleaner: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
     private val tcpSessions = ConcurrentHashMap<String, TcpSession>()
     private val uidSessionMap = ConcurrentHashMap<String, Int>()
-    // قصر القنوات المتزامنة لتوجيه النطاق الترددي نحو الفيديو قيد التشغيل وتقليل التحميل المسبق للخلفية
     private val connectionSlots = Semaphore(3)
     @Volatile private var running = false
     @Volatile var isScreenOn = true
@@ -142,26 +141,14 @@ class PacketForwarder(
         }
     }
 
-    /**
-     * حظر صارم لحزم التطبيقات في الخلفية:
-     * - عند إطفاء الشاشة: حظر كامل.
-     * - عند معرفة UID لتطبيق مستخدم: يُحظر إذا كان ضمن blockedUids أو (عند وجود قائمة allowedUids أو تحديد تطبيق نشط في الواجهة) لم يكن ضمن allowedUids أو activeForegroundUid.
-     * - خدمات النظام الأساسية (uid < FIRST_APPLICATION_UID) تمر دون تعطيل الجهاز.
-     */
+    // لا نحجب الحزم إذا كان uid غير معروف أو إذا لم يكن هناك حظر صريح على هذا الـ uid
     private fun isUidBlockedInBackground(uid: Int): Boolean {
         if (!isScreenOn) return true
         if (uid == Process.INVALID_UID || uid < Process.FIRST_APPLICATION_UID) return false
-
         if (blockedUids.contains(uid)) return true
-
-        if (hasUsagePermission && activeForegroundUid != Process.INVALID_UID) {
-            return uid != activeForegroundUid
+        if (hasUsagePermission && activeForegroundUid != Process.INVALID_UID && uid != activeForegroundUid) {
+            return true
         }
-
-        if (allowedUids.isNotEmpty()) {
-            return !allowedUids.contains(uid)
-        }
-
         return false
     }
 
