@@ -1,6 +1,7 @@
 package com.example.speedlimiter
 
 import android.app.ActivityManager
+import android.app.AppOpsManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -14,6 +15,7 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
+import android.os.Process
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.Locale
@@ -30,13 +32,17 @@ class MyVpnService : VpnService() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var monitorExecutor: ScheduledExecutorService? = null
     private var fgWatcherExecutor: ScheduledExecutorService? = null
-    private var autoRefreshExecutor: ScheduledExecutorService? = null
 
     private var currentLimitKb: Int = 70
     private var lastBytesSnapshot: Long = 0L
     private var boostEndTimeMillis: Long = 0L
+
+    // آخر تطبيق في المقدمة (null = لا يوجد تطبيق في المقدمة)
     private var lastKnownForegroundPkg: String? = null
-    private var savedBgKillPackages: List<String> = emptyList()
+    private var lastEventQueryTime: Long = 0L
+
+    // false = صلاحية "الوصول إلى بيانات الاستخدام" غير ممنوحة، فلا يعمل حظر الخلفية
+    @Volatile private var usageAccessGranted: Boolean = true
 
     companion object {
         @Volatile
@@ -49,7 +55,7 @@ class MyVpnService : VpnService() {
                 stopVpn()
                 return START_NOT_STICKY
             }
-            "BOOST_30S", "BOOST_3M" -> {
+            "BOOST_30S" -> {
                 activateBoost()
                 return START_STICKY
             }
@@ -57,7 +63,7 @@ class MyVpnService : VpnService() {
                 stopBoost()
                 return START_STICKY
             }
-            "INTERNAL_REFRESH", "MANUAL_REFRESH" -> {
+            "INTERNAL_REFRESH" -> {
                 performInternalRefresh()
                 return START_STICKY
             }
@@ -75,16 +81,26 @@ class MyVpnService : VpnService() {
             ?: prefs.getInt("session_limit_kb", 250)
 
         currentLimitKb = speedKb
-        savedBgKillPackages = bgKillPackages
-        killBackgroundProcesses(bgKillPackages)
 
         cleanupTunnel()
         acquireWakeLock()
+        // يجب استدعاء startForeground بسرعة بعد startForegroundService
         startForegroundNotification(buildNotification(0.0, 0.0, 0))
-        startVpn(targetPackages, bgKillPackages, speedKb, sessionLimitKb)
+
+        // قائمتان فارغتان تعني أن النفق سيلتقط كل تطبيقات الهاتف: نمنع ذلك
+        val tunnelPackages = (targetPackages + bgKillPackages).filter { it != packageName }.toSet()
+        if (tunnelPackages.isEmpty()) {
+            stopVpn()
+            return START_NOT_STICKY
+        }
+
+        killBackgroundProcesses(bgKillPackages)
+
+        if (!startVpn(targetPackages, bgKillPackages, tunnelPackages, speedKb, sessionLimitKb)) {
+            return START_NOT_STICKY
+        }
         startForegroundAppWatcher()
         startLiveMonitor()
-        startAutoRefreshTimer()
 
         return START_REDELIVER_INTENT
     }
@@ -93,77 +109,114 @@ class MyVpnService : VpnService() {
         if (!isServiceRunning) return
         boostEndTimeMillis = System.currentTimeMillis() + 30_000L
         rateLimiter?.setBoost(true)
-        refreshNotificationNow()
     }
 
     private fun stopBoost() {
+        if (!isServiceRunning) return
         boostEndTimeMillis = 0L
         rateLimiter?.setBoost(false)
-        refreshNotificationNow()
+        val totalBytes = packetForwarder?.totalBytesTransferred?.get() ?: 0L
+        val totalUsedMb = totalBytes / (1024.0 * 1024.0)
+        val manager = getSystemService(NotificationManager::class.java)
+        manager?.notify(1, buildNotification(0.0, totalUsedMb, 0))
     }
 
     private fun performInternalRefresh() {
         if (!isServiceRunning) return
         try {
-            killBackgroundProcesses(savedBgKillPackages)
+            val prefs = getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
+            val bgKillPackages = ArrayList(prefs.getStringSet("bg_kill_apps", emptySet()) ?: emptySet())
+            killBackgroundProcesses(bgKillPackages)
+            lastEventQueryTime = 0L
             System.gc()
-            refreshNotificationNow()
+            val now = System.currentTimeMillis()
+            val boostRemainingSec = if (boostEndTimeMillis > now) {
+                ((boostEndTimeMillis - now) / 1000L).toInt() + 1
+            } else {
+                0
+            }
+            val totalBytes = packetForwarder?.totalBytesTransferred?.get() ?: 0L
+            val totalUsedMb = totalBytes / (1024.0 * 1024.0)
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.notify(1, buildNotification(0.0, totalUsedMb, boostRemainingSec))
         } catch (_: Exception) {}
     }
 
-    private fun startAutoRefreshTimer() {
-        stopAutoRefreshTimer()
-        autoRefreshExecutor = Executors.newSingleThreadScheduledExecutor()
-        autoRefreshExecutor?.scheduleWithFixedDelay({
-            performInternalRefresh()
-        }, 3, 3, TimeUnit.MINUTES)
-    }
-
-    private fun stopAutoRefreshTimer() {
-        try { autoRefreshExecutor?.shutdownNow() } catch (_: Exception) {}
-        autoRefreshExecutor = null
-    }
-
-    private fun refreshNotificationNow() {
-        if (!isServiceRunning) return
-        val now = System.currentTimeMillis()
-        val remainingSec = if (boostEndTimeMillis > now) ((boostEndTimeMillis - now) / 1000L).toInt() + 1 else 0
-        val totalUsedMb = (packetForwarder?.totalBytesTransferred?.get() ?: 0L) / (1024.0 * 1024.0)
-        val manager = getSystemService(NotificationManager::class.java)
-        manager?.notify(1, buildNotification(0.0, totalUsedMb, remainingSec))
+    private fun hasUsageAccess(): Boolean {
+        return try {
+            val appOps = getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                appOps.unsafeCheckOpNoThrow(
+                    AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), packageName
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                appOps.checkOpNoThrow(
+                    AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), packageName
+                )
+            }
+            mode == AppOpsManager.MODE_ALLOWED
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun startForegroundAppWatcher() {
         fgWatcherExecutor?.shutdownNow()
+        lastKnownForegroundPkg = null
+        lastEventQueryTime = 0L
         fgWatcherExecutor = Executors.newSingleThreadScheduledExecutor()
         fgWatcherExecutor?.scheduleWithFixedDelay({
             if (!isServiceRunning) return@scheduleWithFixedDelay
             try {
-                val fgPkg = getForegroundPackageName()
-                if (fgPkg != null && fgPkg != lastKnownForegroundPkg) {
-                    lastKnownForegroundPkg = fgPkg
+                if (!hasUsageAccess()) {
+                    usageAccessGranted = false
+                    // لا يمكن معرفة تطبيق المقدمة: لا نحظر شيئاً بدل أن نقطع الإنترنت عن الجميع
+                    packetForwarder?.updateForegroundUid(PacketForwarder.UID_UNKNOWN)
+                    return@scheduleWithFixedDelay
                 }
+                usageAccessGranted = true
+
+                val fgPkg = readForegroundPackage()
+                lastKnownForegroundPkg = fgPkg
+
+                // لا تطبيق في المقدمة (أو تطبيق لا نراه): كل التطبيقات المحظورة تُعتبر في الخلفية
+                val uid = if (fgPkg == null) {
+                    PacketForwarder.UID_NONE
+                } else {
+                    try {
+                        packageManager.getApplicationInfo(fgPkg, 0).uid
+                    } catch (_: Exception) {
+                        PacketForwarder.UID_NONE
+                    }
+                }
+                packetForwarder?.updateForegroundUid(uid)
             } catch (_: Exception) {}
         }, 0, 500, TimeUnit.MILLISECONDS)
     }
 
-    private fun getForegroundPackageName(): String? {
-        try {
-            val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
-            val now = System.currentTimeMillis()
-            val events = usm.queryEvents(now - 60_000L, now)
-            val event = UsageEvents.Event()
-            var latestPkg: String? = lastKnownForegroundPkg
-            while (events.hasNextEvent()) {
-                events.getNextEvent(event)
-                if (event.eventType == UsageEvents.Event.ACTIVITY_RESUMED) {
-                    latestPkg = event.packageName
+    /**
+     * يعيد اسم حزمة التطبيق الذي في المقدمة، أو null إن لم يكن هناك واحد
+     * (مثلاً بعد إطفاء الشاشة: يصل حدث ACTIVITY_PAUSED دون ACTIVITY_RESUMED بعده).
+     */
+    private fun readForegroundPackage(): String? {
+        val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+        val now = System.currentTimeMillis()
+        val from = if (lastEventQueryTime == 0L) now - 15 * 60_000L else lastEventQueryTime - 1_000L
+        val events = usm.queryEvents(from, now)
+        val event = UsageEvents.Event()
+        var current: String? = lastKnownForegroundPkg
+        while (events.hasNextEvent()) {
+            events.getNextEvent(event)
+            when (event.eventType) {
+                UsageEvents.Event.ACTIVITY_RESUMED -> current = event.packageName
+                UsageEvents.Event.ACTIVITY_PAUSED -> {
+                    if (event.packageName == current) current = null
                 }
             }
-            return latestPkg
-        } catch (_: Exception) {
-            return lastKnownForegroundPkg
         }
+        lastEventQueryTime = now
+        return current
     }
 
     private fun startLiveMonitor() {
@@ -231,7 +284,14 @@ class MyVpnService : VpnService() {
         } catch (_: Exception) {}
     }
 
-    private fun startVpn(targetPackages: List<String>, bgKillPackages: List<String>, speedKb: Int, sessionLimitKb: Int) {
+    /** يعيد false إذا تعذّر إنشاء النفق (وفي هذه الحالة تكون الخدمة قد أُوقفت). */
+    private fun startVpn(
+        targetPackages: List<String>,
+        bgKillPackages: List<String>,
+        tunnelPackages: Set<String>,
+        speedKb: Int,
+        sessionLimitKb: Int
+    ): Boolean {
         isServiceRunning = true
         getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE).edit()
             .putBoolean("is_running", true).apply()
@@ -262,13 +322,26 @@ class MyVpnService : VpnService() {
             .setMtu(1400)
             .setBlocking(true)
 
-        val allTunnelPackages = (targetPackages + bgKillPackages).toSet()
-        for (pkg in allTunnelPackages) {
-            if (pkg == packageName) continue
-            try { builder.addAllowedApplication(pkg) } catch (_: Exception) {}
+        var addedApps = 0
+        for (pkg in tunnelPackages) {
+            try {
+                builder.addAllowedApplication(pkg)
+                addedApps++
+            } catch (_: Exception) {}
         }
 
-        vpnInterface = builder.establish()
+        // إن فشلت إضافة كل التطبيقات فلا نُنشئ النفق: وإلا سيلتقط كل تطبيقات الهاتف ويقطع الإنترنت عنها
+        if (addedApps == 0) {
+            stopVpn()
+            return false
+        }
+
+        val iface = builder.establish()
+        if (iface == null) {
+            stopVpn()
+            return false
+        }
+        vpnInterface = iface
 
         vpnThread = Thread({
             val fd = vpnInterface?.fileDescriptor ?: return@Thread
@@ -281,10 +354,10 @@ class MyVpnService : VpnService() {
             priority = Thread.MAX_PRIORITY
             start()
         }
+        return true
     }
 
     private fun cleanupTunnel() {
-        stopAutoRefreshTimer()
         stopLiveMonitor()
         packetForwarder?.stop()
         packetForwarder = null
@@ -323,23 +396,17 @@ class MyVpnService : VpnService() {
         )
 
         val boostIntent = PendingIntent.getService(
-            this,
-            1,
-            Intent(this, MyVpnService::class.java).apply { action = "BOOST_30S" },
+            this, 1, Intent(this, MyVpnService::class.java).apply { action = "BOOST_30S" },
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
         val stopBoostIntent = PendingIntent.getService(
-            this,
-            2,
-            Intent(this, MyVpnService::class.java).apply { action = "STOP_BOOST" },
+            this, 2, Intent(this, MyVpnService::class.java).apply { action = "STOP_BOOST" },
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
         val refreshIntent = PendingIntent.getService(
-            this,
-            3,
-            Intent(this, MyVpnService::class.java).apply { action = "INTERNAL_REFRESH" },
+            this, 3, Intent(this, MyVpnService::class.java).apply { action = "INTERNAL_REFRESH" },
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
@@ -349,7 +416,12 @@ class MyVpnService : VpnService() {
             String.format(Locale.US, "السرعة: %.1f KB/s (الحد: %d KB/s)", liveSpeedKb, currentLimitKb)
         }
 
-        val content = String.format(Locale.US, "المستهلك عبر النفق: %.2f MB", totalUsedMb)
+        val usageText = String.format(Locale.US, "المستهلك عبر النفق: %.2f MB", totalUsedMb)
+        val content = if (usageAccessGranted) {
+            usageText
+        } else {
+            "⚠ حظر الخلفية معطّل: فعّل «الوصول إلى بيانات الاستخدام» • $usageText"
+        }
 
         @Suppress("DEPRECATION")
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
