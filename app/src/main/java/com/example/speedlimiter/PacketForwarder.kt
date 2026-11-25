@@ -1,6 +1,9 @@
 package com.example.speedlimiter
 
+import android.net.ConnectivityManager
 import android.net.VpnService
+import android.os.Build
+import android.os.Process
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.DatagramPacket
@@ -11,7 +14,9 @@ import java.net.Socket
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
 class PacketForwarder(
@@ -19,19 +24,42 @@ class PacketForwarder(
     private val rateLimiter: RateLimiter,
     private val maxSessionBytes: Long = Long.MAX_VALUE,
     private val allowedUids: Set<Int> = emptySet(),
-    private val blockedUids: Set<Int> = emptySet()
+    private val blockedUids: Set<Int> = emptySet(),
+    private val connectivityManager: ConnectivityManager? = null
 ) {
     private val executor = Executors.newCachedThreadPool()
+    private val cleaner: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
     private val tcpSessions = ConcurrentHashMap<String, TcpSession>()
-    // السماح باتصالين متزامنين فقط لمنع التحميل المسبق للفيديوهات التالية
-    private val connectionSlots = Semaphore(2)
+    private val uidSessionMap = ConcurrentHashMap<String, Int>()
+    // قصر القنوات المتزامنة لتقليل التحميل المسبق العشوائي وتوجيه السرعة للفيديو قيد التشغيل
+    private val connectionSlots = Semaphore(3)
+
     @Volatile private var running = false
-    @Volatile var currentForegroundUid: Int = -1
+    @Volatile var isScreenOn: Boolean = true
+    @Volatile var activeForegroundUid: Int = Process.INVALID_UID
+    @Volatile var hasUsagePermission: Boolean = false
 
     val totalBytesTransferred = AtomicLong(0L)
 
     fun start(inputStream: FileInputStream, outputStream: FileOutputStream) {
         running = true
+
+        cleaner.scheduleWithFixedDelay({
+            val now = System.currentTimeMillis()
+            val it = tcpSessions.entries.iterator()
+            while (it.hasNext()) {
+                val entry = it.next()
+                val sessionUid = uidSessionMap[entry.key] ?: Process.INVALID_UID
+                val expired = now - entry.value.lastActivityTime > 120_000L
+                val isBlockedNow = !isScreenOn || isUidBlockedInBackground(sessionUid)
+                if (expired || isBlockedNow) {
+                    entry.value.close()
+                    it.remove()
+                    uidSessionMap.remove(entry.key)
+                }
+            }
+        }, 2, 2, TimeUnit.SECONDS)
+
         val packet = ByteBuffer.allocate(32767)
 
         while (running && !Thread.currentThread().isInterrupted) {
@@ -52,16 +80,112 @@ class PacketForwarder(
         }
     }
 
+    fun closeSessionsForUid(targetUid: Int) {
+        if (targetUid == Process.INVALID_UID) return
+        val it = tcpSessions.entries.iterator()
+        while (it.hasNext()) {
+            val entry = it.next()
+            if (uidSessionMap[entry.key] == targetUid) {
+                entry.value.close()
+                it.remove()
+                uidSessionMap.remove(entry.key)
+            }
+        }
+    }
+
+    fun closeAllSessionsImmediately() {
+        val it = tcpSessions.entries.iterator()
+        while (it.hasNext()) {
+            val entry = it.next()
+            entry.value.close()
+            it.remove()
+        }
+        uidSessionMap.clear()
+    }
+
+    fun refreshSessions() {
+        val now = System.currentTimeMillis()
+        val it = tcpSessions.entries.iterator()
+        while (it.hasNext()) {
+            val entry = it.next()
+            val sessionUid = uidSessionMap[entry.key] ?: Process.INVALID_UID
+            if (now - entry.value.lastActivityTime > 60_000L || !isScreenOn || isUidBlockedInBackground(sessionUid)) {
+                entry.value.close()
+                it.remove()
+                uidSessionMap.remove(entry.key)
+            }
+        }
+    }
+
     fun stop() {
         running = false
-        tcpSessions.values.forEach { it.close() }
-        tcpSessions.clear()
-        executor.shutdownNow()
+        try { cleaner.shutdownNow() } catch (_: Exception) {}
+        closeAllSessionsImmediately()
+        try { executor.shutdownNow() } catch (_: Exception) {}
+    }
+
+    private fun resolvePacketOwnerUid(
+        protocol: Int,
+        srcIp: ByteArray,
+        srcPort: Int,
+        dstIp: ByteArray,
+        dstPort: Int
+    ): Int {
+        if (connectivityManager == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return Process.INVALID_UID
+        }
+        return try {
+            val local = InetSocketAddress(InetAddress.getByAddress(srcIp), srcPort)
+            val remote = InetSocketAddress(InetAddress.getByAddress(dstIp), dstPort)
+            connectivityManager.getConnectionOwnerUid(protocol, local, remote)
+        } catch (_: Exception) {
+            Process.INVALID_UID
+        }
+    }
+
+    /**
+     * السلوك المطلوب:
+     * - أي تطبيق مستخدم (uid >= FIRST_APPLICATION_UID) يُحظر إن كان في الخلفية، ويعمل إن فُتح في المقدمة.
+     * - عند إطفاء الشاشة تُحظر حركة التطبيقات وتُغلق الجلسات.
+     * - إذا تعذر تحديد UID (INVALID_UID) أو كان يخص النظام (uid < FIRST_APPLICATION_UID) فلا يُقطع الاتصال العام.
+     */
+    private fun isUidBlockedInBackground(uid: Int): Boolean {
+        if (!isScreenOn) return true
+        if (uid == Process.INVALID_UID || uid < Process.FIRST_APPLICATION_UID) return false
+
+        if (activeForegroundUid != Process.INVALID_UID) {
+            return uid != activeForegroundUid
+        }
+
+        if (hasUsagePermission) {
+            return true
+        }
+
+        if (blockedUids.contains(uid)) return true
+        if (allowedUids.isNotEmpty() && !allowedUids.contains(uid)) return true
+        return false
+    }
+
+    private fun isUidPermittedNow(uid: Int): Boolean {
+        return !isUidBlockedInBackground(uid)
+    }
+
+    private fun applyRateLimit(bytes: Int) {
+        if (bytes <= 0) return
+        try {
+            rateLimiter.acquire(bytes)
+        } catch (_: Exception) {}
     }
 
     private fun handleOutgoingPacket(rawPacket: ByteArray, outputStream: FileOutputStream) {
         if (rawPacket.size < 20) return
         val version = (rawPacket[0].toInt() shr 4) and 0x0F
+
+        if (version == 6) {
+            handleIpv6Packet(rawPacket, outputStream)
+            return
+        }
+
         if (version != 4) return
 
         val ipHeaderLen = (rawPacket[0].toInt() and 0x0F) * 4
@@ -76,6 +200,133 @@ class PacketForwarder(
         }
     }
 
+    private fun handleIpv6Packet(rawPacket: ByteArray, outputStream: FileOutputStream) {
+        if (rawPacket.size < 40) return
+        val nextHeader = rawPacket[6].toInt() and 0xFF
+        val srcIp = rawPacket.copyOfRange(8, 24)
+        val dstIp = rawPacket.copyOfRange(24, 40)
+
+        if (nextHeader == 6 && rawPacket.size >= 60) {
+            val srcPort = ((rawPacket[40].toInt() and 0xFF) shl 8) or (rawPacket[41].toInt() and 0xFF)
+            val dstPort = ((rawPacket[42].toInt() and 0xFF) shl 8) or (rawPacket[43].toInt() and 0xFF)
+            val seqNum = ByteBuffer.wrap(rawPacket, 44, 4).int.toLong() and 0xFFFFFFFFL
+            val flags = rawPacket[53].toInt() and 0xFF
+            val rst = (flags and 0x04) != 0
+            val ownerUid = resolvePacketOwnerUid(6, srcIp, srcPort, dstIp, dstPort)
+            if (!isUidPermittedNow(ownerUid)) {
+                if (!rst) {
+                    val nextSeq = (seqNum + 1) and 0xFFFFFFFFL
+                    val rstV6 = buildTcpIpv6Packet(dstIp, dstPort, srcIp, srcPort, 0L, nextSeq, 0x14)
+                    writeToTunSafe(outputStream, rstV6)
+                }
+                return
+            }
+        } else if (nextHeader == 17 && rawPacket.size >= 48) {
+            val srcPort = ((rawPacket[40].toInt() and 0xFF) shl 8) or (rawPacket[41].toInt() and 0xFF)
+            val dstPort = ((rawPacket[42].toInt() and 0xFF) shl 8) or (rawPacket[43].toInt() and 0xFF)
+            val ownerUid = resolvePacketOwnerUid(17, srcIp, srcPort, dstIp, dstPort)
+            if (!isUidPermittedNow(ownerUid)) {
+                val icmpV6 = buildIcmpv6PortUnreachable(rawPacket, dstIp, srcIp)
+                if (icmpV6 != null) {
+                    writeToTunSafe(outputStream, icmpV6)
+                }
+                return
+            }
+        }
+    }
+
+    private fun buildTcpIpv6Packet(
+        srcIp: ByteArray,
+        srcPort: Int,
+        dstIp: ByteArray,
+        dstPort: Int,
+        seq: Long,
+        ack: Long,
+        flags: Int
+    ): ByteArray {
+        val buf = ByteBuffer.allocate(60)
+        buf.put(0x60.toByte())
+        buf.put(0.toByte())
+        buf.putShort(0)
+        buf.putShort(20.toShort())
+        buf.put(6.toByte())
+        buf.put(64.toByte())
+        buf.put(srcIp)
+        buf.put(dstIp)
+
+        buf.putShort(srcPort.toShort())
+        buf.putShort(dstPort.toShort())
+        buf.putInt(seq.toInt())
+        buf.putInt(ack.toInt())
+        buf.put(0x50.toByte())
+        buf.put(flags.toByte())
+        buf.putShort(0)
+        buf.putShort(0)
+        buf.putShort(0)
+
+        val checksum = computeIpv6UpperChecksum(srcIp, dstIp, 6, buf.array(), 40, 20)
+        buf.putShort(56, checksum)
+        return buf.array()
+    }
+
+    private fun buildIcmpv6PortUnreachable(originalPacket: ByteArray, srcIp: ByteArray, dstIp: ByteArray): ByteArray? {
+        val quotedLen = originalPacket.size.coerceAtMost(1200)
+        if (quotedLen < 48) return null
+        val icmpLen = 8 + quotedLen
+        val totalLen = 40 + icmpLen
+        val buf = ByteBuffer.allocate(totalLen)
+
+        buf.put(0x60.toByte())
+        buf.put(0.toByte())
+        buf.putShort(0)
+        buf.putShort(icmpLen.toShort())
+        buf.put(58.toByte())
+        buf.put(64.toByte())
+        buf.put(srcIp)
+        buf.put(dstIp)
+
+        buf.put(1.toByte())
+        buf.put(4.toByte())
+        buf.putShort(0)
+        buf.putInt(0)
+        buf.put(originalPacket, 0, quotedLen)
+
+        val checksum = computeIpv6UpperChecksum(srcIp, dstIp, 58, buf.array(), 40, icmpLen)
+        buf.putShort(42, checksum)
+        return buf.array()
+    }
+
+    private fun computeIpv6UpperChecksum(
+        srcIp: ByteArray,
+        dstIp: ByteArray,
+        nextHeader: Int,
+        data: ByteArray,
+        offset: Int,
+        length: Int
+    ): Short {
+        var sum = 0L
+        for (i in 0 until 16 step 2) {
+            sum += ((srcIp[i].toInt() and 0xFF) shl 8) or (srcIp[i + 1].toInt() and 0xFF)
+            sum += ((dstIp[i].toInt() and 0xFF) shl 8) or (dstIp[i + 1].toInt() and 0xFF)
+        }
+        sum += (length shr 16) and 0xFFFF
+        sum += length and 0xFFFF
+        sum += nextHeader.toLong()
+
+        var i = offset
+        while (i < offset + length - 1) {
+            sum += ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
+            i += 2
+        }
+        if (length % 2 == 1) {
+            sum += (data[offset + length - 1].toInt() and 0xFF) shl 8
+        }
+        while ((sum shr 16) != 0L) {
+            sum = (sum and 0xFFFF) + (sum shr 16)
+        }
+        return (sum.inv() and 0xFFFF).toShort()
+    }
+
     private fun handleUdpPacket(
         rawPacket: ByteArray,
         ipHeaderLen: Int,
@@ -87,20 +338,33 @@ class PacketForwarder(
         val srcPort = ((rawPacket[ipHeaderLen].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 1].toInt() and 0xFF)
         val dstPort = ((rawPacket[ipHeaderLen + 2].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 3].toInt() and 0xFF)
 
-        if (dstPort == 443) return
+        val ownerUid = resolvePacketOwnerUid(17, srcIp, srcPort, dstIp, dstPort)
+        if (!isUidPermittedNow(ownerUid)) {
+            return
+        }
+
+        if (dstPort != 53) return
 
         val payloadOffset = ipHeaderLen + 8
         val payloadLen = rawPacket.size - payloadOffset
         if (payloadLen <= 0) return
         val payload = rawPacket.copyOfRange(payloadOffset, rawPacket.size)
 
+        if (isDnsAaaaQuery(payload)) {
+            val emptyDnsResponse = buildEmptyDnsResponse(payload)
+            val ipResponse = buildUdpIpPacket(dstIp, dstPort, srcIp, srcPort, emptyDnsResponse)
+            writeToTunSafe(outputStream, ipResponse)
+            return
+        }
+
         executor.execute {
             var socket: DatagramSocket? = null
             try {
                 socket = DatagramSocket()
                 vpnService.protect(socket)
-                socket.soTimeout = 5000
+                socket.soTimeout = 4000
 
+                applyRateLimit(payload.size)
                 val dstAddress = InetAddress.getByAddress(dstIp)
                 socket.send(DatagramPacket(payload, payload.size, dstAddress, dstPort))
                 totalBytesTransferred.addAndGet(payload.size.toLong())
@@ -110,16 +374,69 @@ class PacketForwarder(
                 socket.receive(respPacket)
 
                 val respData = respPacket.data.copyOf(respPacket.length)
+                applyRateLimit(respData.size)
                 totalBytesTransferred.addAndGet(respData.size.toLong())
                 val ipResponse = buildUdpIpPacket(dstIp, dstPort, srcIp, srcPort, respData)
-                synchronized(outputStream) {
-                    outputStream.write(ipResponse)
-                }
+                writeToTunSafe(outputStream, ipResponse)
             } catch (_: Exception) {
             } finally {
                 try { socket?.close() } catch (_: Exception) {}
             }
         }
+    }
+
+    private fun writeToTunSafe(outputStream: FileOutputStream, packet: ByteArray) {
+        synchronized(outputStream) {
+            try {
+                outputStream.write(packet)
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun isDnsAaaaQuery(dnsPayload: ByteArray): Boolean {
+        if (dnsPayload.size < 16) return false
+        var pos = 12
+        while (pos < dnsPayload.size) {
+            val len = dnsPayload[pos].toInt() and 0xFF
+            if (len == 0) {
+                pos++
+                break
+            }
+            if ((len and 0xC0) == 0xC0) {
+                pos += 2
+                break
+            }
+            pos += len + 1
+        }
+        if (pos + 2 > dnsPayload.size) return false
+        val qType = ((dnsPayload[pos].toInt() and 0xFF) shl 8) or (dnsPayload[pos + 1].toInt() and 0xFF)
+        return qType == 28
+    }
+
+    private fun buildEmptyDnsResponse(query: ByteArray): ByteArray {
+        var pos = 12
+        while (pos < query.size) {
+            val len = query[pos].toInt() and 0xFF
+            if (len == 0) {
+                pos += 5
+                break
+            }
+            if ((len and 0xC0) == 0xC0) {
+                pos += 6
+                break
+            }
+            pos += len + 1
+        }
+        val endPos = pos.coerceAtMost(query.size)
+        val resp = query.copyOf(endPos)
+        if (resp.size >= 12) {
+            resp[2] = 0x81.toByte()
+            resp[3] = 0x80.toByte()
+            resp[6] = 0; resp[7] = 0
+            resp[8] = 0; resp[9] = 0
+            resp[10] = 0; resp[11] = 0
+        }
+        return resp
     }
 
     private fun handleTcpPacket(
@@ -142,6 +459,20 @@ class PacketForwarder(
         val fin = (flags and 0x01) != 0
         val rst = (flags and 0x04) != 0
 
+        val sessionKey = "${InetAddress.getByAddress(srcIp).hostAddress}:$srcPort-${InetAddress.getByAddress(dstIp).hostAddress}:$dstPort"
+        val ownerUid = resolvePacketOwnerUid(6, srcIp, srcPort, dstIp, dstPort)
+
+        if (!isUidPermittedNow(ownerUid)) {
+            tcpSessions.remove(sessionKey)?.close()
+            uidSessionMap.remove(sessionKey)
+            if (!rst) {
+                val nextSeq = (seqNum + 1) and 0xFFFFFFFFL
+                val rstPkt = buildTcpIpPacket(dstIp, dstPort, srcIp, srcPort, 0L, nextSeq, 0x14, ByteArray(0))
+                writeToTunSafe(outputStream, rstPkt)
+            }
+            return
+        }
+
         val payloadOffset = ipHeaderLen + tcpHeaderLen
         val payload = if (rawPacket.size > payloadOffset) {
             rawPacket.copyOfRange(payloadOffset, rawPacket.size)
@@ -149,26 +480,33 @@ class PacketForwarder(
             ByteArray(0)
         }
 
-        val sessionKey = "${InetAddress.getByAddress(srcIp).hostAddress}:$srcPort-${InetAddress.getByAddress(dstIp).hostAddress}:$dstPort"
-
         if (rst) {
             tcpSessions.remove(sessionKey)?.close()
+            uidSessionMap.remove(sessionKey)
             return
         }
 
         if (syn && !ack) {
-            tcpSessions.remove(sessionKey)?.close()
-            val session = TcpSession(sessionKey, srcIp, srcPort, dstIp, dstPort, seqNum, outputStream)
+            val existing = tcpSessions[sessionKey]
+            if (existing != null && existing.initialSeq == seqNum) {
+                existing.resendSynAckIfReady()
+                return
+            }
+            existing?.close()
+            val session = TcpSession(sessionKey, ownerUid, srcIp, srcPort, dstIp, dstPort, seqNum, outputStream)
             tcpSessions[sessionKey] = session
+            uidSessionMap[sessionKey] = ownerUid
             executor.execute { session.connect() }
             return
         }
 
         val session = tcpSessions[sessionKey] ?: return
+        session.lastActivityTime = System.currentTimeMillis()
 
         if (fin) {
             session.handleClientFin(seqNum)
             tcpSessions.remove(sessionKey)
+            uidSessionMap.remove(sessionKey)
             return
         }
 
@@ -179,81 +517,105 @@ class PacketForwarder(
 
     inner class TcpSession(
         private val key: String,
+        private val ownerUid: Int,
         private val clientIp: ByteArray,
         private val clientPort: Int,
         private val remoteIp: ByteArray,
         private val remotePort: Int,
-        initialClientSeq: Long,
+        val initialSeq: Long,
         private val outputStream: FileOutputStream
     ) {
         private val socket = Socket()
         private var mySeq: Long = 10000L
-        private var clientNextSeq: Long = (initialClientSeq + 1) and 0xFFFFFFFFL
+        private var clientNextSeq: Long = (initialSeq + 1) and 0xFFFFFFFFL
         private var totalDownloadedBytes: Long = 0L
+        @Volatile var lastActivityTime: Long = System.currentTimeMillis()
         @Volatile private var connected = false
         @Volatile private var slotAcquired = false
 
+        fun resendSynAckIfReady() {
+            if (connected) {
+                val synAck = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, 10000L, clientNextSeq, 0x12, ByteArray(0))
+                writeToTunSafe(outputStream, synAck)
+            }
+        }
+
         fun connect() {
             try {
-                // انتظار توفر قناة اتصال من القناتين المسموحتين
+                if (!isUidPermittedNow(ownerUid)) return
                 connectionSlots.acquire()
                 slotAcquired = true
 
                 vpnService.protect(socket)
                 socket.tcpNoDelay = true
-                // ضبط حجم مخزن الاستقبال قبل الاتصال لإجبار نواة لينكس على إعلان نافذة صغيرة للخادم
-                socket.receiveBufferSize = 1024
-                socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 8000)
+                socket.soTimeout = 45000
+                socket.receiveBufferSize = 2048
+                socket.sendBufferSize = 4096
+                socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 10000)
                 connected = true
+                lastActivityTime = System.currentTimeMillis()
 
                 val synAck = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x12, ByteArray(0))
                 mySeq = (mySeq + 1) and 0xFFFFFFFFL
-                writeToTun(synAck)
+                writeToTunSafe(outputStream, synAck)
 
                 val inStream = socket.getInputStream()
-                val buffer = ByteArray(512)
+                val buffer = ByteArray(1024)
                 while (running && connected && !socket.isClosed) {
+                    if (!isUidPermittedNow(ownerUid)) {
+                        val rstPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x14, ByteArray(0))
+                        writeToTunSafe(outputStream, rstPkt)
+                        break
+                    }
                     val read = inStream.read(buffer)
+                    lastActivityTime = System.currentTimeMillis()
                     if (read == -1) {
                         val finPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x11, ByteArray(0))
                         mySeq = (mySeq + 1) and 0xFFFFFFFFL
-                        writeToTun(finPkt)
+                        writeToTunSafe(outputStream, finPkt)
                         break
                     }
                     if (read > 0) {
                         if (maxSessionBytes != Long.MAX_VALUE && totalDownloadedBytes >= maxSessionBytes) {
                             val rstPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x14, ByteArray(0))
-                            writeToTun(rstPkt)
+                            writeToTunSafe(outputStream, rstPkt)
                             break
                         }
-                        rateLimiter.acquire(read)
+                        // تحديد سرعة التنزيل لجميع التطبيقات
+                        applyRateLimit(read)
                         totalDownloadedBytes += read
                         totalBytesTransferred.addAndGet(read.toLong())
                         val chunk = buffer.copyOf(read)
                         val dataPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x18, chunk)
                         mySeq = (mySeq + read) and 0xFFFFFFFFL
-                        writeToTun(dataPkt)
+                        writeToTunSafe(outputStream, dataPkt)
                     }
                 }
             } catch (_: Exception) {
             } finally {
                 close()
                 tcpSessions.remove(key)
+                uidSessionMap.remove(key)
             }
         }
 
         @Synchronized
         fun sendToRemote(data: ByteArray, seq: Long) {
             if (!connected || socket.isClosed) return
+            if (!isUidPermittedNow(ownerUid)) {
+                close()
+                return
+            }
             try {
-                if (seq == clientNextSeq) {
-                    clientNextSeq = (seq + data.size) and 0xFFFFFFFFL
-                    socket.getOutputStream().write(data)
-                    socket.getOutputStream().flush()
-                    totalBytesTransferred.addAndGet(data.size.toLong())
-                }
+                lastActivityTime = System.currentTimeMillis()
+                // تحديد سرعة الرفع لجميع التطبيقات
+                applyRateLimit(data.size)
+                socket.getOutputStream().write(data)
+                socket.getOutputStream().flush()
+                totalBytesTransferred.addAndGet(data.size.toLong())
+                clientNextSeq = (seq + data.size) and 0xFFFFFFFFL
                 val ackPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x10, ByteArray(0))
-                writeToTun(ackPkt)
+                writeToTunSafe(outputStream, ackPkt)
             } catch (_: Exception) {
                 close()
             }
@@ -264,17 +626,9 @@ class PacketForwarder(
             try {
                 clientNextSeq = (seq + 1) and 0xFFFFFFFFL
                 val finAck = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x11, ByteArray(0))
-                writeToTun(finAck)
+                writeToTunSafe(outputStream, finAck)
             } catch (_: Exception) {}
             close()
-        }
-
-        private fun writeToTun(pkt: ByteArray) {
-            synchronized(outputStream) {
-                try {
-                    outputStream.write(pkt)
-                } catch (_: Exception) {}
-            }
         }
 
         fun close() {
@@ -350,7 +704,7 @@ class PacketForwarder(
         buf.putInt(ack.toInt())
         buf.put(0x50.toByte())
         buf.put(flags.toByte())
-        buf.putShort(1024.toShort())
+        buf.putShort(2048.toShort())
         buf.putShort(0)
         buf.putShort(0)
         buf.put(payload)
