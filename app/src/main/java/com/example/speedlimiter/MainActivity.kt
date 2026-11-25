@@ -10,7 +10,6 @@ import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.text.InputType
-import android.view.Gravity
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
@@ -24,8 +23,12 @@ class MainActivity : Activity() {
     private val vpnRequestCode = 1001
     private var isVpnActive = false
     private lateinit var toggleButton: Button
+    private lateinit var selectAllButton: Button
     private lateinit var speedInput: EditText
     private lateinit var statusText: TextView
+
+    private val allUserPackages = mutableListOf<String>()
+    private val checkBoxes = mutableListOf<CheckBox>()
     private val selectedPackages = mutableSetOf<String>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -46,7 +49,7 @@ class MainActivity : Activity() {
         rootLayout.addView(titleText)
 
         statusText = TextView(this).apply {
-            text = "الحالة: متوقف (ملاحظة: تمرير الحزم الكامل يتطلب توجيه الشبكة)"
+            text = "الحالة: متوقف"
             textSize = 14f
             setTextColor(Color.DKGRAY)
             setPadding(0, 12, 0, 16)
@@ -88,8 +91,38 @@ class MainActivity : Activity() {
         val btnParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = 16; bottomMargin = 20 }
+        ).apply { topMargin = 16; bottomMargin = 12 }
         rootLayout.addView(toggleButton, btnParams)
+
+        selectAllButton = Button(this).apply {
+            text = "تحديد الكل"
+            textSize = 15f
+            setOnClickListener {
+                val shouldSelectAll = selectedPackages.size < allUserPackages.size
+                selectedPackages.clear()
+                for (i in checkBoxes.indices) {
+                    val cb = checkBoxes[i]
+                    cb.setOnCheckedChangeListener(null)
+                    cb.isChecked = shouldSelectAll
+                    if (shouldSelectAll && i < allUserPackages.size) {
+                        selectedPackages.add(allUserPackages[i])
+                    }
+                    val pkg = allUserPackages.getOrNull(i)
+                    if (pkg != null) {
+                        cb.setOnCheckedChangeListener { _, isChecked ->
+                            if (isChecked) selectedPackages.add(pkg) else selectedPackages.remove(pkg)
+                            updateSelectAllButtonLabel()
+                        }
+                    }
+                }
+                updateSelectAllButtonLabel()
+            }
+        }
+        val selectAllParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = 16 }
+        rootLayout.addView(selectAllButton, selectAllParams)
 
         val appsHeader = TextView(this).apply {
             text = "قائمة التطبيقات المثبتة (غير النظامية):"
@@ -132,14 +165,18 @@ class MainActivity : Activity() {
         for (appInfo in userPackages) {
             val label = pm.getApplicationLabel(appInfo).toString()
             val pkgName = appInfo.packageName
+            allUserPackages.add(pkgName)
+
             val checkBox = CheckBox(this).apply {
                 text = "$label ($pkgName)"
                 textSize = 14f
                 setTextColor(Color.BLACK)
                 setOnCheckedChangeListener { _, isChecked ->
                     if (isChecked) selectedPackages.add(pkgName) else selectedPackages.remove(pkgName)
+                    updateSelectAllButtonLabel()
                 }
             }
+            checkBoxes.add(checkBox)
             appsListLayout.addView(checkBox)
         }
 
@@ -147,6 +184,15 @@ class MainActivity : Activity() {
         rootLayout.addView(scrollView)
 
         setContentView(rootLayout)
+        updateSelectAllButtonLabel()
+    }
+
+    private fun updateSelectAllButtonLabel() {
+        selectAllButton.text = if (allUserPackages.isNotEmpty() && selectedPackages.size == allUserPackages.size) {
+            "إلغاء تحديد الكل"
+        } else {
+            "تحديد الكل"
+        }
     }
 
     @Deprecated("Deprecated in Java")
@@ -160,21 +206,25 @@ class MainActivity : Activity() {
     private fun startSpeedLimiterVpn() {
         val speedKbps = speedInput.text.toString().toLongOrNull() ?: 150L
         val intent = Intent(this, MyVpnService::class.java).apply {
-            putExtra("speed_kbps", speedKbps)
-            putStringArrayListExtra("selected_packages", ArrayList(selectedPackages))
+            putExtra(MyVpnService.EXTRA_SPEED_KBPS, speedKbps)
+            putStringArrayListExtra(MyVpnService.EXTRA_SELECTED_PACKAGES, ArrayList(selectedPackages))
         }
         startService(intent)
         isVpnActive = true
         toggleButton.text = "إيقاف SpeedLimiter VPN"
         statusText.text = "الحالة: نشط — الحد: $speedKbps KB/s | التطبيقات المحددة: ${selectedPackages.size}"
-        statusText.gravity = Gravity.START
         Toast.makeText(this, "تم بدء الخدمة بحد $speedKbps KB/s", Toast.LENGTH_SHORT).show()
     }
 
     private fun stopSpeedLimiterVpn() {
+        val stopIntent = Intent(this, MyVpnService::class.java).apply {
+            action = MyVpnService.ACTION_STOP
+        }
+        startService(stopIntent)
         stopService(Intent(this, MyVpnService::class.java))
         isVpnActive = false
         toggleButton.text = "تشغيل SpeedLimiter VPN"
         statusText.text = "الحالة: متوقف"
+        Toast.makeText(this, "تم إيقاف VPN", Toast.LENGTH_SHORT).show()
     }
 }
