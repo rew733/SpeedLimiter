@@ -12,7 +12,6 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
-import java.util.TreeMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -55,7 +54,7 @@ class PacketForwarder(
                     uidSessionMap.remove(entry.key)
                 }
             }
-        }, 2, 2, TimeUnit.SECONDS)
+        }, 3, 3, TimeUnit.SECONDS)
 
         val packet = ByteBuffer.allocate(32767)
 
@@ -140,28 +139,15 @@ class PacketForwarder(
         }
     }
 
-    /**
-     * منطق التبديل اللحظي بين "مسموح له بالمرور عبر النفق المقيّد" و"محظور في الخلفية":
-     * - عند إطفاء الشاشة: يُحظر الجميع وتُغلق الجلسات.
-     * - خدمات النظام الأساسية (uid < FIRST_APPLICATION_UID): تمر دون تعطيل الجهاز.
-     * - التطبيق المفتوح حالياً في المقدمة (activeForegroundUid): يُرفع عنه الحظر مؤقتاً ويُسمح له بالمرور بالسرعة المحددة.
-     * - أي تطبيق مستخدم آخر ليس في المقدمة: يُعد في حكم "محظور في الخلفية" وتُغلق جلساته فوراً.
-     * - إذا لم يكن إذن Usage Access مفعلاً بعد: يُسمح لتطبيقات allowedUids بالعمل ويُحظر blockedUids.
-     */
     private fun isUidBlockedInBackground(uid: Int): Boolean {
         if (!isScreenOn) return true
         if (uid == Process.INVALID_UID || uid < Process.FIRST_APPLICATION_UID) return false
 
-        if (activeForegroundUid != Process.INVALID_UID) {
+        if (hasUsagePermission && activeForegroundUid != Process.INVALID_UID) {
             return uid != activeForegroundUid
         }
 
-        if (hasUsagePermission) {
-            return true
-        }
-
         if (blockedUids.contains(uid)) return true
-        if (allowedUids.isNotEmpty() && !allowedUids.contains(uid)) return true
         return false
     }
 
@@ -509,7 +495,6 @@ class PacketForwarder(
         private var mySeq: Long = 10000L
         private var clientNextSeq: Long = (initialSeq + 1) and 0xFFFFFFFFL
         private var totalDownloadedBytes: Long = 0L
-        private val outOfOrderBuffer = TreeMap<Long, ByteArray>()
         @Volatile var lastActivityTime: Long = System.currentTimeMillis()
         @Volatile private var connected = false
 
@@ -537,7 +522,7 @@ class PacketForwarder(
                 writeToTunSafe(outputStream, synAck)
 
                 val inStream = socket.getInputStream()
-                val buffer = ByteArray(1300)
+                val buffer = ByteArray(1400)
                 while (running && connected && !socket.isClosed) {
                     if (!isUidPermittedNow(ownerUid)) {
                         val rstPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x14, ByteArray(0))
@@ -586,27 +571,15 @@ class PacketForwarder(
             }
             try {
                 lastActivityTime = System.currentTimeMillis()
-                if (seq == clientNextSeq) {
-                    writeOrderedChunk(data, seq)
-                    while (outOfOrderBuffer.containsKey(clientNextSeq)) {
-                        val nextChunk = outOfOrderBuffer.remove(clientNextSeq) ?: break
-                        writeOrderedChunk(nextChunk, clientNextSeq)
-                    }
-                } else if (seq > clientNextSeq && outOfOrderBuffer.size < 16) {
-                    outOfOrderBuffer[seq] = data
-                }
+                socket.getOutputStream().write(data)
+                socket.getOutputStream().flush()
+                totalBytesTransferred.addAndGet(data.size.toLong())
+                clientNextSeq = (seq + data.size) and 0xFFFFFFFFL
                 val ackPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x10, ByteArray(0))
                 writeToTunSafe(outputStream, ackPkt)
             } catch (_: Exception) {
                 close()
             }
-        }
-
-        private fun writeOrderedChunk(data: ByteArray, seq: Long) {
-            clientNextSeq = (seq + data.size) and 0xFFFFFFFFL
-            socket.getOutputStream().write(data)
-            socket.getOutputStream().flush()
-            totalBytesTransferred.addAndGet(data.size.toLong())
         }
 
         @Synchronized
@@ -621,7 +594,6 @@ class PacketForwarder(
 
         fun close() {
             connected = false
-            outOfOrderBuffer.clear()
             try {
                 socket.close()
             } catch (_: Exception) {}

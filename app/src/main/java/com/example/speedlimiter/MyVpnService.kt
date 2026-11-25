@@ -88,7 +88,7 @@ class MyVpnService : VpnService() {
         savedAllowedPackages = targetPackages.filter { !bgKillPackages.contains(it) && it != packageName }
         launcherPackages = resolveLauncherPackages()
 
-        killBackgroundProcesses(getAllManagedBackgroundPackages())
+        killBackgroundProcesses(getBlockedNonForegroundPackages())
 
         cleanupTunnel()
         acquireWakeLock()
@@ -138,7 +138,7 @@ class MyVpnService : VpnService() {
                         packetForwarder?.isScreenOn = false
                         packetForwarder?.activeForegroundUid = Process.INVALID_UID
                         packetForwarder?.closeAllSessionsImmediately()
-                        killBackgroundProcesses(getAllManagedPackages())
+                        killBackgroundProcesses(savedBgKillPackages)
                     }
                     Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
                         val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
@@ -169,17 +169,9 @@ class MyVpnService : VpnService() {
         screenReceiver = null
     }
 
-    private fun getAllManagedPackages(): List<String> {
-        return LinkedHashSet<String>().apply {
-            addAll(savedAllowedPackages)
-            addAll(savedBgKillPackages)
-            remove(packageName)
-        }.toList()
-    }
-
-    private fun getAllManagedBackgroundPackages(): List<String> {
+    private fun getBlockedNonForegroundPackages(): List<String> {
         val fgPkg = detectForegroundPackageName()
-        return getAllManagedPackages().filter { it != fgPkg }
+        return savedBgKillPackages.filter { it != fgPkg && it != packageName }
     }
 
     private fun detectForegroundPackageName(): String? {
@@ -229,10 +221,6 @@ class MyVpnService : VpnService() {
         return lastDetectedForegroundPkg
     }
 
-    /**
-     * عند فتح تطبيق: يُرفع عنه الحظر مؤقتاً ويُصبح هو التطبيق النشط المسموح له بالسرعة المحددة.
-     * عند إغلاقه أو الخروج منه: تُغلق جلساته فوراً ويعود إلى حكم تطبيقات الخلفية المحظورة.
-     */
     private fun updateForegroundAppState() {
         val forwarder = packetForwarder ?: return
         val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
@@ -277,7 +265,7 @@ class MyVpnService : VpnService() {
         try {
             updateForegroundAppState()
             packetForwarder?.refreshSessions()
-            killBackgroundProcesses(getAllManagedBackgroundPackages())
+            killBackgroundProcesses(getBlockedNonForegroundPackages())
             System.gc()
             refreshNotificationNow()
         } catch (_: Exception) {}
@@ -303,9 +291,9 @@ class MyVpnService : VpnService() {
             if (!isServiceRunning) return@scheduleWithFixedDelay
             try {
                 updateForegroundAppState()
-                killBackgroundProcesses(getAllManagedBackgroundPackages())
+                killBackgroundProcesses(getBlockedNonForegroundPackages())
             } catch (_: Exception) {}
-        }, 2, 2, TimeUnit.SECONDS)
+        }, 3, 4, TimeUnit.SECONDS)
     }
 
     private fun stopBackgroundEnforcer() {
