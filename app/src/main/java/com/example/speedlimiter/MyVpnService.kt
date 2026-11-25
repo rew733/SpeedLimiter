@@ -82,7 +82,6 @@ class MyVpnService : VpnService() {
 
         currentLimitKb = speedKb
         savedBgKillPackages = bgKillPackages
-        // التطبيقات المسموح لها بالعمل (فقط عندما تكون في الواجهة المباشرة)
         savedAllowedPackages = targetPackages.filter { !bgKillPackages.contains(it) && it != packageName }
 
         killBackgroundProcesses(getAllNonForegroundManagedPackages())
@@ -152,10 +151,6 @@ class MyVpnService : VpnService() {
         return getAllManagedPackages().filter { it != fgPkg }
     }
 
-    /**
-     * تحديد التطبيق الذي يستخدمه المستخدم مباشرة الآن في الواجهة.
-     * بمجرد الخروج من التطبيق يصبح في حكم تطبيقات الخلفية وتُقطع عنه البيانات فوراً.
-     */
     private fun detectForegroundPackageName(): String? {
         try {
             val usm = getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
@@ -251,7 +246,6 @@ class MyVpnService : VpnService() {
         autoRefreshExecutor = null
     }
 
-    // فحص التطبيق النشط في المقدمة كل 1.5 ثانية وإغلاق أي تطبيق خرج منه المستخدم فوراً
     private fun startBackgroundEnforcer() {
         stopBackgroundEnforcer()
         bgEnforcerExecutor = Executors.newSingleThreadScheduledExecutor()
