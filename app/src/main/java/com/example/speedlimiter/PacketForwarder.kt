@@ -12,12 +12,15 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
+import java.util.ArrayDeque
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 class PacketForwarder(
     private val vpnService: VpnService,
@@ -37,16 +40,30 @@ class PacketForwarder(
          * أقصى عدد اتصالات TCP متزامنة لكل تطبيق (كان 2 لكل التطبيقات مجتمعة).
          * أنزله إلى 2 إن أردت منع التحميل المسبق للفيديوهات بشكل أشد.
          */
-        private const val MAX_CONNECTIONS_PER_APP = 4
+        private const val MAX_CONNECTIONS_PER_APP = 8
 
         /** عند تعذّر معرفة صاحب الاتصال (أندرويد أقدم من 10) تُشارك كل التطبيقات هذا الحد */
         private const val MAX_CONNECTIONS_UNKNOWN_UID = 32
 
         private const val SLOT_WAIT_SECONDS = 10L
         private const val UID_CACHE_TTL_MS = 30_000L
+
+        private const val SEQ_MASK = 0xFFFFFFFFL
+
+        /** أقصى حمولة لكل حزمة = MTU (1400) - 40 بايت ترويسة */
+        private const val MAX_PAYLOAD = 1360
+
+        private const val RTO_MIN_MS = 400L
+        private const val RTO_MAX_MS = 3000L
+        private const val MAX_RETRIES = 12
+        private const val RETRANS_BURST = 4
+        private const val DRAIN_WAIT_MS = 5000L
     }
 
     private class CachedUid(val uid: Int, val time: Long)
+
+    /** مقطع بيانات أُرسل إلى التطبيق ولم يصله تأكيد (ACK) بعد */
+    private class Segment(val seq: Long, val data: ByteArray)
 
     private val executor = Executors.newCachedThreadPool()
     private val tcpSessions = ConcurrentHashMap<String, TcpSession>()
@@ -54,6 +71,7 @@ class PacketForwarder(
     // قنوات اتصال مستقلة لكل تطبيق: تطبيق واحد لا يستطيع تجويع بقية التطبيقات
     private val connectionSlots = ConcurrentHashMap<Int, Semaphore>()
     private val uidCache = ConcurrentHashMap<String, CachedUid>()
+    private val retransmitTimer = Executors.newSingleThreadScheduledExecutor()
     private val connectivityManager: ConnectivityManager? =
         vpnService.getSystemService(ConnectivityManager::class.java)
 
@@ -67,6 +85,11 @@ class PacketForwarder(
 
     fun start(inputStream: FileInputStream, outputStream: FileOutputStream) {
         running = true
+        retransmitTimer.scheduleWithFixedDelay({
+            for (session in tcpSessions.values) {
+                try { session.checkRetransmit() } catch (_: Exception) {}
+            }
+        }, 100, 100, TimeUnit.MILLISECONDS)
         val packet = ByteBuffer.allocate(32767)
 
         while (running && !Thread.currentThread().isInterrupted) {
@@ -91,6 +114,7 @@ class PacketForwarder(
         running = false
         tcpSessions.values.forEach { it.close() }
         tcpSessions.clear()
+        retransmitTimer.shutdownNow()
         executor.shutdownNow()
     }
 
@@ -146,6 +170,14 @@ class PacketForwarder(
         connectionSlots.getOrPut(uid) {
             Semaphore(if (uid < 0) MAX_CONNECTIONS_UNKNOWN_UID else MAX_CONNECTIONS_PER_APP)
         }
+
+    private fun seqDiff(a: Long, b: Long): Long = (a - b) and SEQ_MASK
+    private fun seqLt(a: Long, b: Long): Boolean = a != b && seqDiff(a, b) > 0x7FFFFFFFL
+    private fun seqLe(a: Long, b: Long): Boolean = a == b || seqLt(a, b)
+
+    /** نافذة الاستقبال المطلوبة من الخادم: نحو 0.3 ثانية من السرعة المحددة (بين 16KB و256KB) */
+    private fun receiveWindowBytes(): Int =
+        (rateLimiter.bytesPerSecond * 3 / 10).coerceIn(16L * 1024, 256L * 1024).toInt()
 
     private fun writePacket(outputStream: FileOutputStream, pkt: ByteArray) {
         synchronized(outputStream) {
@@ -315,6 +347,12 @@ class PacketForwarder(
             return
         }
 
+        if (ack) {
+            val ackNum = ByteBuffer.wrap(rawPacket, ipHeaderLen + 8, 4).int.toLong() and 0xFFFFFFFFL
+            val window = ((rawPacket[ipHeaderLen + 14].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 15].toInt() and 0xFF)
+            session.onClientAck(ackNum, window, payload.isEmpty() && !fin)
+        }
+
         if (fin) {
             session.handleClientFin(seqNum)
             tcpSessions.remove(sessionKey, session)
@@ -340,8 +378,8 @@ class PacketForwarder(
 
         private val socket = Socket()
         private val initialSeq: Long = 10000L
-        private var mySeq: Long = initialSeq
-        private var clientNextSeq: Long = (initialClientSeq + 1) and 0xFFFFFFFFL
+        @Volatile private var mySeq: Long = initialSeq
+        @Volatile private var clientNextSeq: Long = (initialClientSeq + 1) and SEQ_MASK
         private var totalDownloadedBytes: Long = 0L
         private val slot: Semaphore = slotFor(uid)
         private val slotHeld = AtomicBoolean(false)
@@ -349,6 +387,16 @@ class PacketForwarder(
         @Volatile private var connected = false
         @Volatile private var closed = false
         @Volatile private var handshakeDone = false
+
+        // التحكم بالتدفق وإعادة الإرسال نحو التطبيق (كل ما يلي محمي بـ flowLock)
+        private val flowLock = ReentrantLock()
+        private val flowChanged = flowLock.newCondition()
+        private val unacked = ArrayDeque<Segment>()
+        private var sndUna: Long = (initialSeq + 1) and SEQ_MASK
+        private var clientWindow: Int = 16384
+        private var dupAcks = 0
+        private var retries = 0
+        private var lastProgress = 0L
 
         fun connect() {
             try {
@@ -364,24 +412,35 @@ class PacketForwarder(
 
                 vpnService.protect(socket)
                 socket.tcpNoDelay = true
-                // ضبط حجم مخزن الاستقبال قبل الاتصال لإجبار نواة لينكس على إعلان نافذة صغيرة للخادم
-                socket.receiveBufferSize = 1024
+                // نافذة استقبال متناسبة مع السرعة المحددة: التقييد الفعلي يتم بالـ RateLimiter،
+                // أما نافذة 1KB السابقة فكانت تحصر كل اتصال بعشرات الكيلوبايت مهما رُفع الحد
+                socket.receiveBufferSize = receiveWindowBytes()
                 socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 8000)
                 if (closed) return
                 connected = true
 
-                val synAck = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x12, ByteArray(0))
-                mySeq = (mySeq + 1) and 0xFFFFFFFFL
+                flowLock.withLock {
+                    mySeq = (initialSeq + 1) and SEQ_MASK
+                    sndUna = mySeq
+                    lastProgress = System.currentTimeMillis()
+                }
+                val synAck = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, initialSeq, clientNextSeq, 0x12, ByteArray(0))
                 writeToTun(synAck)
                 handshakeDone = true
 
                 val inStream = socket.getInputStream()
-                val buffer = ByteArray(512)
+                val buffer = ByteArray(MAX_PAYLOAD)
                 while (running && connected && !socket.isClosed) {
                     val read = inStream.read(buffer)
                     if (read == -1) {
-                        val finPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x11, ByteArray(0))
-                        mySeq = (mySeq + 1) and 0xFFFFFFFFL
+                        // نتأكد أن التطبيق استلم كل البيانات قبل إرسال FIN
+                        waitForDrain(DRAIN_WAIT_MS)
+                        val finSeq = flowLock.withLock {
+                            val s = mySeq
+                            mySeq = (mySeq + 1) and SEQ_MASK
+                            s
+                        }
+                        val finPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, finSeq, clientNextSeq, 0x11, ByteArray(0))
                         writeToTun(finPkt)
                         break
                     }
@@ -394,13 +453,12 @@ class PacketForwarder(
                             sendRst()
                             break
                         }
+                        // لا نرسل أكثر مما تسمح به نافذة التطبيق (كان يُرسل دون مراعاة النافذة فتضيع البيانات)
+                        if (!waitForWindow(read)) break
                         rateLimiter.acquire(read)
                         totalDownloadedBytes += read
                         totalBytesTransferred.addAndGet(read.toLong())
-                        val chunk = buffer.copyOf(read)
-                        val dataPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x18, chunk)
-                        mySeq = (mySeq + read) and 0xFFFFFFFFL
-                        writeToTun(dataPkt)
+                        sendData(buffer.copyOf(read))
                     }
                 }
             } catch (_: Exception) {
@@ -413,11 +471,105 @@ class PacketForwarder(
             }
         }
 
+        private fun sendData(chunk: ByteArray) {
+            val seg = flowLock.withLock {
+                val s = Segment(mySeq, chunk)
+                if (unacked.isEmpty()) lastProgress = System.currentTimeMillis()
+                unacked.addLast(s)
+                mySeq = (mySeq + chunk.size) and SEQ_MASK
+                s
+            }
+            writeSegment(seg)
+        }
+
+        private fun writeSegment(seg: Segment) {
+            val pkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, seg.seq, clientNextSeq, 0x18, seg.data)
+            writeToTun(pkt)
+        }
+
+        /** ينتظر حتى تتسع نافذة التطبيق للبيانات الجديدة. يعيد false إذا أُغلقت الجلسة. */
+        private fun waitForWindow(len: Int): Boolean {
+            flowLock.withLock {
+                while (!closed && running) {
+                    val inflight = seqDiff(mySeq, sndUna)
+                    if (inflight + len <= clientWindow.toLong()) return true
+                    flowChanged.await(200, TimeUnit.MILLISECONDS)
+                }
+            }
+            return false
+        }
+
+        private fun waitForDrain(maxMs: Long) {
+            val deadline = System.currentTimeMillis() + maxMs
+            flowLock.withLock {
+                while (!closed && !unacked.isEmpty() && System.currentTimeMillis() < deadline) {
+                    flowChanged.await(100, TimeUnit.MILLISECONDS)
+                }
+            }
+        }
+
+        /** يُستدعى لكل حزمة ACK قادمة من التطبيق: يحدّث النافذة ويحذف المقاطع المؤكَّدة */
+        fun onClientAck(ack: Long, window: Int, pureAck: Boolean) {
+            if (!connected) return
+            var fastRetransmit: Segment? = null
+            flowLock.withLock {
+                clientWindow = window
+                if (seqLt(sndUna, ack) && seqLe(ack, mySeq)) {
+                    sndUna = ack
+                    while (true) {
+                        val first = unacked.peekFirst() ?: break
+                        val end = (first.seq + first.data.size) and SEQ_MASK
+                        if (seqLe(end, ack)) unacked.pollFirst() else break
+                    }
+                    dupAcks = 0
+                    retries = 0
+                    lastProgress = System.currentTimeMillis()
+                } else if (pureAck && ack == sndUna && !unacked.isEmpty()) {
+                    dupAcks++
+                    if (dupAcks == 3) fastRetransmit = unacked.peekFirst()
+                }
+                flowChanged.signalAll()
+            }
+            fastRetransmit?.let { writeSegment(it) }
+        }
+
+        /** يُستدعى دورياً: يعيد إرسال المقاطع التي لم تُؤكَّد، ويقطع الجلسة إن انقطع التطبيق تماماً */
+        fun checkRetransmit() {
+            if (closed || !connected) return
+            var toResend: List<Segment> = emptyList()
+            var giveUp = false
+            flowLock.withLock {
+                if (!unacked.isEmpty()) {
+                    val now = System.currentTimeMillis()
+                    val rto = minOf(RTO_MIN_MS shl minOf(retries, 4), RTO_MAX_MS)
+                    if (now - lastProgress >= rto) {
+                        retries++
+                        lastProgress = now
+                        if (retries > MAX_RETRIES) {
+                            giveUp = true
+                        } else {
+                            val list = ArrayList<Segment>()
+                            for (s in unacked) {
+                                if (list.size >= RETRANS_BURST) break
+                                list.add(s)
+                            }
+                            toResend = list
+                        }
+                    }
+                }
+            }
+            if (giveUp) {
+                reset()
+                return
+            }
+            for (seg in toResend) writeSegment(seg)
+        }
+
         fun resendSynAckIfConnected() {
             if (!connected || closed) return
             val synAck = buildTcpIpPacket(
                 remoteIp, remotePort, clientIp, clientPort,
-                initialSeq, (clientIsn + 1) and 0xFFFFFFFFL, 0x12, ByteArray(0)
+                initialSeq, (clientIsn + 1) and SEQ_MASK, 0x12, ByteArray(0)
             )
             writeToTun(synAck)
         }
@@ -427,7 +579,7 @@ class PacketForwarder(
             if (!connected || closed || socket.isClosed) return
             try {
                 if (seq == clientNextSeq) {
-                    clientNextSeq = (seq + data.size) and 0xFFFFFFFFL
+                    clientNextSeq = (seq + data.size) and SEQ_MASK
                     socket.getOutputStream().write(data)
                     socket.getOutputStream().flush()
                     totalBytesTransferred.addAndGet(data.size.toLong())
@@ -442,7 +594,7 @@ class PacketForwarder(
         @Synchronized
         fun handleClientFin(seq: Long) {
             try {
-                clientNextSeq = (seq + 1) and 0xFFFFFFFFL
+                clientNextSeq = (seq + 1) and SEQ_MASK
                 val finAck = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x11, ByteArray(0))
                 writeToTun(finAck)
             } catch (_: Exception) {}
@@ -478,6 +630,7 @@ class PacketForwarder(
             try {
                 socket.close()
             } catch (_: Exception) {}
+            flowLock.withLock { flowChanged.signalAll() }
         }
     }
 
