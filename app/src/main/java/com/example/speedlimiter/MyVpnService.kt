@@ -59,6 +59,14 @@ class MyVpnService : VpnService() {
                 activateBoost()
                 return START_STICKY
             }
+            "STOP_BOOST" -> {
+                stopBoost()
+                return START_STICKY
+            }
+            "INTERNAL_REFRESH" -> {
+                performInternalRefresh()
+                return START_STICKY
+            }
         }
 
         val prefs = getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
@@ -101,6 +109,37 @@ class MyVpnService : VpnService() {
         if (!isServiceRunning) return
         boostEndTimeMillis = System.currentTimeMillis() + 30_000L
         rateLimiter?.setBoost(true)
+    }
+
+    private fun stopBoost() {
+        if (!isServiceRunning) return
+        boostEndTimeMillis = 0L
+        rateLimiter?.setBoost(false)
+        val totalBytes = packetForwarder?.totalBytesTransferred?.get() ?: 0L
+        val totalUsedMb = totalBytes / (1024.0 * 1024.0)
+        val manager = getSystemService(NotificationManager::class.java)
+        manager?.notify(1, buildNotification(0.0, totalUsedMb, 0))
+    }
+
+    private fun performInternalRefresh() {
+        if (!isServiceRunning) return
+        try {
+            val prefs = getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
+            val bgKillPackages = ArrayList(prefs.getStringSet("bg_kill_apps", emptySet()) ?: emptySet())
+            killBackgroundProcesses(bgKillPackages)
+            lastEventQueryTime = 0L
+            System.gc()
+            val now = System.currentTimeMillis()
+            val boostRemainingSec = if (boostEndTimeMillis > now) {
+                ((boostEndTimeMillis - now) / 1000L).toInt() + 1
+            } else {
+                0
+            }
+            val totalBytes = packetForwarder?.totalBytesTransferred?.get() ?: 0L
+            val totalUsedMb = totalBytes / (1024.0 * 1024.0)
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.notify(1, buildNotification(0.0, totalUsedMb, boostRemainingSec))
+        } catch (_: Exception) {}
     }
 
     private fun hasUsageAccess(): Boolean {
@@ -361,8 +400,13 @@ class MyVpnService : VpnService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        val stopIntent = PendingIntent.getService(
-            this, 2, Intent(this, MyVpnService::class.java).apply { action = "STOP" },
+        val stopBoostIntent = PendingIntent.getService(
+            this, 2, Intent(this, MyVpnService::class.java).apply { action = "STOP_BOOST" },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val refreshIntent = PendingIntent.getService(
+            this, 3, Intent(this, MyVpnService::class.java).apply { action = "INTERNAL_REFRESH" },
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
@@ -392,10 +436,16 @@ class MyVpnService : VpnService() {
             boostIntent
         ).build()
 
-        val stopAction = Notification.Action.Builder(
-            android.R.drawable.ic_menu_close_clear_cancel,
-            "إيقاف",
-            stopIntent
+        val stopBoostAction = Notification.Action.Builder(
+            android.R.drawable.ic_media_pause,
+            "🛑 إيقاف التعزيز",
+            stopBoostIntent
+        ).build()
+
+        val refreshAction = Notification.Action.Builder(
+            android.R.drawable.ic_popup_sync,
+            "🔄 تحديث",
+            refreshIntent
         ).build()
 
         return builder
@@ -406,7 +456,8 @@ class MyVpnService : VpnService() {
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .addAction(boostAction)
-            .addAction(stopAction)
+            .addAction(stopBoostAction)
+            .addAction(refreshAction)
             .build()
     }
 
