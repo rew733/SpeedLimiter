@@ -28,6 +28,7 @@ class MyVpnService : VpnService() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var monitorExecutor: ScheduledExecutorService? = null
     private var autoRefreshExecutor: ScheduledExecutorService? = null
+    private var bgEnforcerExecutor: ScheduledExecutorService? = null
 
     private var currentLimitKb: Int = 70
     private var lastBytesSnapshot: Long = 0L
@@ -72,14 +73,23 @@ class MyVpnService : VpnService() {
 
         currentLimitKb = speedKb
         savedBgKillPackages = bgKillPackages
+
+        // دمج تطبيقات السرعة وتطبيقات حظر الخلفية داخل النفق لضمان عدم تسرب أي حزمة خارج الحد
+        val unifiedTunnelPackages = LinkedHashSet<String>().apply {
+            addAll(targetPackages)
+            addAll(bgKillPackages)
+            remove(packageName)
+        }.toList()
+
         killBackgroundProcesses(bgKillPackages)
 
         cleanupTunnel()
         acquireWakeLock()
         startForegroundNotification(buildNotification(0.0, 0.0, 0))
-        startVpn(targetPackages, speedKb, sessionLimitKb)
+        startVpn(unifiedTunnelPackages, speedKb, sessionLimitKb)
         startLiveMonitor()
         startAutoRefreshTimer()
+        startBackgroundEnforcer()
 
         return START_REDELIVER_INTENT
     }
@@ -105,6 +115,22 @@ class MyVpnService : VpnService() {
     private fun stopAutoRefreshTimer() {
         try { autoRefreshExecutor?.shutdownNow() } catch (_: Exception) {}
         autoRefreshExecutor = null
+    }
+
+    // مراقب دوري كل 12 ثانية لإيقاف تطبيقات الخلفية المحددة ومنع سحبها للبيانات أو الإشعارات
+    private fun startBackgroundEnforcer() {
+        stopBackgroundEnforcer()
+        if (savedBgKillPackages.isEmpty()) return
+        bgEnforcerExecutor = Executors.newSingleThreadScheduledExecutor()
+        bgEnforcerExecutor?.scheduleWithFixedDelay({
+            if (!isServiceRunning) return@scheduleWithFixedDelay
+            killBackgroundProcesses(savedBgKillPackages)
+        }, 12, 12, TimeUnit.SECONDS)
+    }
+
+    private fun stopBackgroundEnforcer() {
+        try { bgEnforcerExecutor?.shutdownNow() } catch (_: Exception) {}
+        bgEnforcerExecutor = null
     }
 
     private fun activateBoost() {
@@ -164,6 +190,7 @@ class MyVpnService : VpnService() {
     }
 
     private fun killBackgroundProcesses(packages: List<String>) {
+        if (packages.isEmpty()) return
         try {
             val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
             for (pkg in packages) {
@@ -234,6 +261,7 @@ class MyVpnService : VpnService() {
     }
 
     private fun cleanupTunnel() {
+        stopBackgroundEnforcer()
         stopAutoRefreshTimer()
         stopLiveMonitor()
         packetForwarder?.stop()
