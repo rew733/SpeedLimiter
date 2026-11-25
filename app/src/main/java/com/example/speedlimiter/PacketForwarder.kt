@@ -1,515 +1,438 @@
 package com.example.speedlimiter
 
+import android.app.ActivityManager
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
 import android.net.VpnService
+import android.os.Build
+import android.os.ParcelFileDescriptor
+import android.os.PowerManager
+import android.os.Process
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.net.Socket
-import java.nio.ByteBuffer
-import java.util.concurrent.ConcurrentHashMap
+import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicLong
 
-class PacketForwarder(
-    private val vpnService: VpnService,
-    private val rateLimiter: RateLimiter,
-    private val maxSessionBytes: Long = Long.MAX_VALUE
-) {
-    private val executor = Executors.newCachedThreadPool()
-    private val cleaner: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
-    private val tcpSessions = ConcurrentHashMap<String, TcpSession>()
-    @Volatile private var running = false
+class MyVpnService : VpnService() {
 
-    val totalBytesTransferred = AtomicLong(0L)
+    private var vpnInterface: ParcelFileDescriptor? = null
+    private var vpnThread: Thread? = null
+    private var packetForwarder: PacketForwarder? = null
+    private var rateLimiter: RateLimiter? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var monitorExecutor: ScheduledExecutorService? = null
+    private var autoRefreshExecutor: ScheduledExecutorService? = null
+    private var bgEnforcerExecutor: ScheduledExecutorService? = null
 
-    fun start(inputStream: FileInputStream, outputStream: FileOutputStream) {
-        running = true
+    private var currentLimitKb: Int = 70
+    private var lastBytesSnapshot: Long = 0L
+    private var boostEndTimeMillis: Long = 0L
+    private var savedBgKillPackages: List<String> = emptyList()
 
-        cleaner.scheduleWithFixedDelay({
-            val now = System.currentTimeMillis()
-            val it = tcpSessions.entries.iterator()
-            while (it.hasNext()) {
-                val entry = it.next()
-                if (now - entry.value.lastActivityTime > 60_000L) {
-                    entry.value.close()
-                    it.remove()
-                }
-            }
-        }, 20, 20, TimeUnit.SECONDS)
-
-        val packet = ByteBuffer.allocate(32767)
-
-        while (running && !Thread.currentThread().isInterrupted) {
-            try {
-                val length = inputStream.read(packet.array())
-                if (length > 0) {
-                    val data = packet.array().copyOf(length)
-                    handleOutgoingPacket(data, outputStream)
-                    packet.clear()
-                } else {
-                    Thread.sleep(2)
-                }
-            } catch (_: InterruptedException) {
-                break
-            } catch (_: Exception) {
-                Thread.sleep(5)
-            }
-        }
+    companion object {
+        @Volatile
+        var isServiceRunning = false
     }
 
-    fun refreshSessions() {
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            "STOP" -> {
+                stopVpn()
+                return START_NOT_STICKY
+            }
+            "BOOST_3M" -> {
+                activateBoost()
+                return START_STICKY
+            }
+            "STOP_BOOST" -> {
+                stopBoost()
+                return START_STICKY
+            }
+            "MANUAL_REFRESH" -> {
+                performInternalRefresh()
+                return START_STICKY
+            }
+        }
+
+        val prefs = getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
+        val targetPackages = intent?.getStringArrayListExtra("TARGET_APPS")
+            ?: ArrayList(prefs.getStringSet("selected_apps", emptySet()) ?: emptySet())
+        val bgKillPackages = intent?.getStringArrayListExtra("BG_KILL_APPS")
+            ?: ArrayList(prefs.getStringSet("bg_kill_apps", emptySet()) ?: emptySet())
+
+        val speedKb = intent?.getIntExtra("SPEED_KB", prefs.getInt("speed_kb", 70))
+            ?: prefs.getInt("speed_kb", 70)
+        val sessionLimitKb = intent?.getIntExtra("SESSION_LIMIT_KB", prefs.getInt("session_limit_kb", 0))
+            ?: prefs.getInt("session_limit_kb", 0)
+
+        currentLimitKb = speedKb
+        savedBgKillPackages = bgKillPackages
+
+        killBackgroundProcesses(bgKillPackages)
+
+        cleanupTunnel()
+        acquireWakeLock()
+        startForegroundNotification(buildNotification(0.0, 0.0, 0))
+        startVpn(targetPackages, bgKillPackages, speedKb, sessionLimitKb)
+        startLiveMonitor()
+        startAutoRefreshTimer()
+        startBackgroundEnforcer()
+
+        return START_REDELIVER_INTENT
+    }
+
+    private fun performInternalRefresh() {
+        if (!isServiceRunning) return
+        try {
+            packetForwarder?.refreshSessions()
+            killBackgroundProcesses(savedBgKillPackages)
+            System.gc()
+            refreshNotificationNow()
+        } catch (_: Exception) {}
+    }
+
+    private fun startAutoRefreshTimer() {
+        stopAutoRefreshTimer()
+        autoRefreshExecutor = Executors.newSingleThreadScheduledExecutor()
+        autoRefreshExecutor?.scheduleWithFixedDelay({
+            performInternalRefresh()
+        }, 3, 3, TimeUnit.MINUTES)
+    }
+
+    private fun stopAutoRefreshTimer() {
+        try { autoRefreshExecutor?.shutdownNow() } catch (_: Exception) {}
+        autoRefreshExecutor = null
+    }
+
+    private fun startBackgroundEnforcer() {
+        stopBackgroundEnforcer()
+        if (savedBgKillPackages.isEmpty()) return
+        bgEnforcerExecutor = Executors.newSingleThreadScheduledExecutor()
+        bgEnforcerExecutor?.scheduleWithFixedDelay({
+            if (!isServiceRunning) return@scheduleWithFixedDelay
+            killBackgroundProcesses(savedBgKillPackages)
+        }, 5, 5, TimeUnit.SECONDS)
+    }
+
+    private fun stopBackgroundEnforcer() {
+        try { bgEnforcerExecutor?.shutdownNow() } catch (_: Exception) {}
+        bgEnforcerExecutor = null
+    }
+
+    private fun activateBoost() {
+        if (!isServiceRunning) return
+        boostEndTimeMillis = System.currentTimeMillis() + 180_000L
+        rateLimiter?.setBoost(true)
+        refreshNotificationNow()
+    }
+
+    private fun stopBoost() {
+        boostEndTimeMillis = 0L
+        rateLimiter?.setBoost(false)
+        refreshNotificationNow()
+    }
+
+    private fun refreshNotificationNow() {
+        if (!isServiceRunning) return
         val now = System.currentTimeMillis()
-        val it = tcpSessions.entries.iterator()
-        while (it.hasNext()) {
-            val entry = it.next()
-            if (now - entry.value.lastActivityTime > 30_000L) {
-                entry.value.close()
-                it.remove()
-            }
-        }
+        val remainingSec = if (boostEndTimeMillis > now) ((boostEndTimeMillis - now) / 1000L).toInt() + 1 else 0
+        val totalUsedMb = (packetForwarder?.totalBytesTransferred?.get() ?: 0L) / (1024.0 * 1024.0)
+        val manager = getSystemService(NotificationManager::class.java)
+        manager?.notify(1, buildNotification(0.0, totalUsedMb, remainingSec))
     }
 
-    fun stop() {
-        running = false
-        try { cleaner.shutdownNow() } catch (_: Exception) {}
-        val it = tcpSessions.entries.iterator()
-        while (it.hasNext()) {
-            val entry = it.next()
-            entry.value.close()
-            it.remove()
-        }
-        try { executor.shutdownNow() } catch (_: Exception) {}
-    }
-
-    private fun handleOutgoingPacket(rawPacket: ByteArray, outputStream: FileOutputStream) {
-        if (rawPacket.size < 20) return
-        val version = (rawPacket[0].toInt() shr 4) and 0x0F
-        if (version != 4) return
-
-        val ipHeaderLen = (rawPacket[0].toInt() and 0x0F) * 4
-        if (rawPacket.size < ipHeaderLen) return
-        val protocol = rawPacket[9].toInt() and 0xFF
-        val srcIp = ByteArray(4) { rawPacket[12 + it] }
-        val dstIp = ByteArray(4) { rawPacket[16 + it] }
-
-        when (protocol) {
-            17 -> handleUdpPacket(rawPacket, ipHeaderLen, srcIp, dstIp, outputStream)
-            6 -> handleTcpPacket(rawPacket, ipHeaderLen, srcIp, dstIp, outputStream)
-        }
-    }
-
-    private fun handleUdpPacket(
-        rawPacket: ByteArray,
-        ipHeaderLen: Int,
-        srcIp: ByteArray,
-        dstIp: ByteArray,
-        outputStream: FileOutputStream
-    ) {
-        if (rawPacket.size < ipHeaderLen + 8) return
-        val srcPort = ((rawPacket[ipHeaderLen].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 1].toInt() and 0xFF)
-        val dstPort = ((rawPacket[ipHeaderLen + 2].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 3].toInt() and 0xFF)
-
-        if (dstPort == 443) {
-            val icmpUnreachable = buildIcmpPortUnreachable(rawPacket, ipHeaderLen)
-            if (icmpUnreachable != null) {
-                writeToTunSafe(outputStream, icmpUnreachable)
-            }
-            return
-        }
-
-        if (dstPort != 53) return
-
-        val payloadOffset = ipHeaderLen + 8
-        val payloadLen = rawPacket.size - payloadOffset
-        if (payloadLen <= 0) return
-        val payload = rawPacket.copyOfRange(payloadOffset, rawPacket.size)
-
-        if (isDnsAaaaQuery(payload)) {
-            val emptyDnsResponse = buildEmptyDnsResponse(payload)
-            val ipResponse = buildUdpIpPacket(dstIp, dstPort, srcIp, srcPort, emptyDnsResponse)
-            writeToTunSafe(outputStream, ipResponse)
-            return
-        }
-
-        executor.execute {
-            var socket: DatagramSocket? = null
+    private fun startLiveMonitor() {
+        stopLiveMonitor()
+        lastBytesSnapshot = 0L
+        monitorExecutor = Executors.newSingleThreadScheduledExecutor()
+        monitorExecutor?.scheduleWithFixedDelay({
+            if (!isServiceRunning) return@scheduleWithFixedDelay
             try {
-                socket = DatagramSocket()
-                vpnService.protect(socket)
-                socket.soTimeout = 2000
+                val now = System.currentTimeMillis()
+                var boostRemainingSec = 0
+                if (boostEndTimeMillis > now) {
+                    boostRemainingSec = ((boostEndTimeMillis - now) / 1000L).toInt() + 1
+                    rateLimiter?.setBoost(true)
+                } else if (rateLimiter?.isBoostActive == true) {
+                    rateLimiter?.setBoost(false)
+                }
 
-                val dstAddress = InetAddress.getByAddress(dstIp)
-                socket.send(DatagramPacket(payload, payload.size, dstAddress, dstPort))
-                totalBytesTransferred.addAndGet(payload.size.toLong())
+                val totalBytes = packetForwarder?.totalBytesTransferred?.get() ?: 0L
+                val deltaBytes = (totalBytes - lastBytesSnapshot).coerceAtLeast(0L)
+                lastBytesSnapshot = totalBytes
 
-                val respBuf = ByteArray(2048)
-                val respPacket = DatagramPacket(respBuf, respBuf.size)
-                socket.receive(respPacket)
+                val liveSpeedKb = deltaBytes / 1024.0
+                val totalUsedMb = totalBytes / (1024.0 * 1024.0)
 
-                val respData = respPacket.data.copyOf(respPacket.length)
-                totalBytesTransferred.addAndGet(respData.size.toLong())
-                val ipResponse = buildUdpIpPacket(dstIp, dstPort, srcIp, srcPort, respData)
-                writeToTunSafe(outputStream, ipResponse)
-            } catch (_: Exception) {
-            } finally {
-                try { socket?.close() } catch (_: Exception) {}
-            }
-        }
+                val manager = getSystemService(NotificationManager::class.java)
+                manager?.notify(1, buildNotification(liveSpeedKb, totalUsedMb, boostRemainingSec))
+            } catch (_: Exception) {}
+        }, 1, 1, TimeUnit.SECONDS)
     }
 
-    private fun writeToTunSafe(outputStream: FileOutputStream, packet: ByteArray) {
-        synchronized(outputStream) {
+    private fun stopLiveMonitor() {
+        try { monitorExecutor?.shutdownNow() } catch (_: Exception) {}
+        monitorExecutor = null
+    }
+
+    private fun killBackgroundProcesses(packages: List<String>) {
+        if (packages.isEmpty()) return
+        try {
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            for (pkg in packages) {
+                if (pkg == packageName) continue
+                am.killBackgroundProcesses(pkg)
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun resolveBlockedUids(packages: List<String>): Set<Int> {
+        val uids = HashSet<Int>()
+        val pm = packageManager
+        for (pkg in packages) {
+            if (pkg == packageName || pkg == "com.google.android.gms") continue
             try {
-                outputStream.write(packet)
+                val appInfo = pm.getApplicationInfo(pkg, 0)
+                if (appInfo.uid >= Process.FIRST_APPLICATION_UID) {
+                    uids.add(appInfo.uid)
+                }
             } catch (_: Exception) {}
         }
+        return uids
     }
 
-    private fun isDnsAaaaQuery(dnsPayload: ByteArray): Boolean {
-        if (dnsPayload.size < 16) return false
-        var pos = 12
-        while (pos < dnsPayload.size) {
-            val len = dnsPayload[pos].toInt() and 0xFF
-            if (len == 0) {
-                pos++
-                break
+    private fun acquireWakeLock() {
+        try {
+            if (wakeLock == null) {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SpeedLimiter::VpnWakeLock")
+                wakeLock?.setReferenceCounted(false)
             }
-            if ((len and 0xC0) == 0xC0) {
-                pos += 2
-                break
+            if (wakeLock?.isHeld == false) {
+                wakeLock?.acquire(24 * 60 * 60 * 1000L)
             }
-            pos += len + 1
-        }
-        if (pos + 2 > dnsPayload.size) return false
-        val qType = ((dnsPayload[pos].toInt() and 0xFF) shl 8) or (dnsPayload[pos + 1].toInt() and 0xFF)
-        return qType == 28
+        } catch (_: Exception) {}
     }
 
-    private fun buildEmptyDnsResponse(query: ByteArray): ByteArray {
-        var pos = 12
-        while (pos < query.size) {
-            val len = query[pos].toInt() and 0xFF
-            if (len == 0) {
-                pos += 5
-                break
-            }
-            if ((len and 0xC0) == 0xC0) {
-                pos += 6
-                break
-            }
-            pos += len + 1
-        }
-        val endPos = pos.coerceAtMost(query.size)
-        val resp = query.copyOf(endPos)
-        if (resp.size >= 12) {
-            resp[2] = 0x81.toByte()
-            resp[3] = 0x80.toByte()
-            resp[6] = 0; resp[7] = 0
-            resp[8] = 0; resp[9] = 0
-            resp[10] = 0; resp[11] = 0
-        }
-        return resp
+    private fun releaseWakeLock() {
+        try {
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+        } catch (_: Exception) {}
     }
 
-    private fun handleTcpPacket(
-        rawPacket: ByteArray,
-        ipHeaderLen: Int,
-        srcIp: ByteArray,
-        dstIp: ByteArray,
-        outputStream: FileOutputStream
+    private fun startVpn(
+        allowedSpeedPackages: List<String>,
+        blockedBgPackages: List<String>,
+        speedKb: Int,
+        sessionLimitKb: Int
     ) {
-        if (rawPacket.size < ipHeaderLen + 20) return
-        val srcPort = ((rawPacket[ipHeaderLen].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 1].toInt() and 0xFF)
-        val dstPort = ((rawPacket[ipHeaderLen + 2].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 3].toInt() and 0xFF)
-        val seqNum = ByteBuffer.wrap(rawPacket, ipHeaderLen + 4, 4).int.toLong() and 0xFFFFFFFFL
-        val tcpHeaderLen = ((rawPacket[ipHeaderLen + 12].toInt() shr 4) and 0x0F) * 4
-        if (rawPacket.size < ipHeaderLen + tcpHeaderLen) return
-        val flags = rawPacket[ipHeaderLen + 13].toInt() and 0xFF
+        isServiceRunning = true
+        getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE).edit()
+            .putBoolean("is_running", true).apply()
 
-        val syn = (flags and 0x02) != 0
-        val ack = (flags and 0x10) != 0
-        val fin = (flags and 0x01) != 0
-        val rst = (flags and 0x04) != 0
+        val limiter = RateLimiter(speedKb.toLong() * 1024L)
+        rateLimiter = limiter
+        val maxSessionBytes = if (sessionLimitKb > 0) sessionLimitKb.toLong() * 1024L else Long.MAX_VALUE
 
-        val payloadOffset = ipHeaderLen + tcpHeaderLen
-        val payload = if (rawPacket.size > payloadOffset) {
-            rawPacket.copyOfRange(payloadOffset, rawPacket.size)
+        val blockedUids = resolveBlockedUids(blockedBgPackages)
+        val connManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+
+        packetForwarder = PacketForwarder(
+            vpnService = this,
+            rateLimiter = limiter,
+            maxSessionBytes = maxSessionBytes,
+            blockedUids = blockedUids,
+            connectivityManager = connManager
+        )
+
+        val builder = Builder()
+            .setSession("SpeedLimiter")
+            .addAddress("10.0.0.2", 32)
+            .addRoute("0.0.0.0", 0)
+            .addAddress("fd00:1::2", 64)
+            .addRoute("::", 0)
+            .addDnsServer("8.8.8.8")
+            .addDnsServer("1.1.1.1")
+            .addDnsServer("2001:4860:4860::8888")
+            .setMtu(1400)
+            .setBlocking(true)
+
+        val essentialSystemExceptions = setOf(
+            packageName,
+            "com.android.phone",
+            "com.android.mms",
+            "com.android.server.telecom",
+            "com.android.providers.telephony"
+        )
+
+        for (excludedPkg in essentialSystemExceptions) {
+            try {
+                builder.addDisallowedApplication(excludedPkg)
+            } catch (_: Exception) {}
+        }
+
+        vpnInterface = builder.establish()
+
+        vpnThread = Thread({
+            val fd = vpnInterface?.fileDescriptor ?: return@Thread
+            val inputStream = FileInputStream(fd)
+            val outputStream = FileOutputStream(fd)
+            try {
+                packetForwarder?.start(inputStream, outputStream)
+            } catch (_: Exception) {}
+        }, "VpnTunnelThread").apply {
+            priority = Thread.MAX_PRIORITY
+            start()
+        }
+    }
+
+    private fun cleanupTunnel() {
+        stopBackgroundEnforcer()
+        stopAutoRefreshTimer()
+        stopLiveMonitor()
+        packetForwarder?.stop()
+        packetForwarder = null
+        rateLimiter = null
+        vpnThread?.interrupt()
+        vpnThread = null
+        try { vpnInterface?.close() } catch (_: Exception) {}
+        vpnInterface = null
+    }
+
+    private fun stopVpn() {
+        isServiceRunning = false
+        getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE).edit()
+            .putBoolean("is_running", false).apply()
+
+        cleanupTunnel()
+        releaseWakeLock()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun buildNotification(liveSpeedKb: Double, totalUsedMb: Double, boostRemainingSec: Int): Notification {
+        val channelId = "speed_limiter_channel"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(channelId, "Speed Limiter Service", NotificationManager.IMPORTANCE_LOW).apply {
+                setShowBadge(false)
+                setSound(null, null)
+            }
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.createNotificationChannel(channel)
+        }
+
+        val openAppIntent = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val boostIntent = PendingIntent.getService(
+            this,
+            1,
+            Intent(this, MyVpnService::class.java).apply { action = "BOOST_3M" },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val stopBoostIntent = PendingIntent.getService(
+            this,
+            2,
+            Intent(this, MyVpnService::class.java).apply { action = "STOP_BOOST" },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val refreshIntent = PendingIntent.getService(
+            this,
+            3,
+            Intent(this, MyVpnService::class.java).apply { action = "MANUAL_REFRESH" },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val title = if (boostRemainingSec > 0) {
+            val mins = boostRemainingSec / 60
+            val secs = boostRemainingSec % 60
+            String.format(Locale.US, "🚀 التعزيز نشط (%02d:%02d) - %.1f KB/s", mins, secs, liveSpeedKb)
         } else {
-            ByteArray(0)
+            String.format(Locale.US, "السرعة: %.1f KB/s (الحد: %d KB/s)", liveSpeedKb, currentLimitKb)
         }
 
-        val sessionKey = "${InetAddress.getByAddress(srcIp).hostAddress}:$srcPort-${InetAddress.getByAddress(dstIp).hostAddress}:$dstPort"
+        val content = String.format(Locale.US, "المستهلك عبر النفق: %.2f MB", totalUsedMb)
 
-        if (rst) {
-            tcpSessions.remove(sessionKey)?.close()
-            return
+        @Suppress("DEPRECATION")
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, channelId)
+        } else {
+            Notification.Builder(this)
         }
 
-        if (syn && !ack) {
-            tcpSessions.remove(sessionKey)?.close()
-            val session = TcpSession(sessionKey, srcIp, srcPort, dstIp, dstPort, seqNum, outputStream)
-            tcpSessions[sessionKey] = session
-            executor.execute { session.connect() }
-            return
-        }
+        val boostAction = Notification.Action.Builder(
+            android.R.drawable.ic_media_ff,
+            "🚀 تعزيز 3د",
+            boostIntent
+        ).build()
 
-        val session = tcpSessions[sessionKey] ?: return
-        session.lastActivityTime = System.currentTimeMillis()
+        val stopBoostAction = Notification.Action.Builder(
+            android.R.drawable.ic_media_pause,
+            "🛑 إيقاف التعزيز",
+            stopBoostIntent
+        ).build()
 
-        if (fin) {
-            session.handleClientFin(seqNum)
-            tcpSessions.remove(sessionKey)
-            return
-        }
+        val refreshAction = Notification.Action.Builder(
+            android.R.drawable.ic_popup_sync,
+            "🔄 تحديث",
+            refreshIntent
+        ).build()
 
-        if (payload.isNotEmpty()) {
-            session.sendToRemote(payload, seqNum)
+        return builder
+            .setContentTitle(title)
+            .setContentText(content)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentIntent(openAppIntent)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .addAction(boostAction)
+            .addAction(stopBoostAction)
+            .addAction(refreshAction)
+            .build()
+    }
+
+    private fun startForegroundNotification(notification: Notification) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(1, notification)
         }
     }
 
-    inner class TcpSession(
-        private val key: String,
-        private val clientIp: ByteArray,
-        private val clientPort: Int,
-        private val remoteIp: ByteArray,
-        private val remotePort: Int,
-        initialClientSeq: Long,
-        private val outputStream: FileOutputStream
-    ) {
-        private val socket = Socket()
-        private var mySeq: Long = 10000L
-        private var clientNextSeq: Long = (initialClientSeq + 1) and 0xFFFFFFFFL
-        private var totalDownloadedBytes: Long = 0L
-        @Volatile var lastActivityTime: Long = System.currentTimeMillis()
-        @Volatile private var connected = false
-
-        fun connect() {
-            try {
-                rateLimiter.acquire(512)
-                vpnService.protect(socket)
-                socket.tcpNoDelay = true
-                socket.soTimeout = 45000
-                socket.receiveBufferSize = 4096
-                socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 6000)
-                connected = true
-                lastActivityTime = System.currentTimeMillis()
-
-                val synAck = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x12, ByteArray(0))
-                mySeq = (mySeq + 1) and 0xFFFFFFFFL
-                writeToTunSafe(outputStream, synAck)
-
-                val inStream = socket.getInputStream()
-                val buffer = ByteArray(1200)
-                while (running && connected && !socket.isClosed) {
-                    val read = inStream.read(buffer)
-                    lastActivityTime = System.currentTimeMillis()
-                    if (read == -1) {
-                        val finPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x11, ByteArray(0))
-                        mySeq = (mySeq + 1) and 0xFFFFFFFFL
-                        writeToTunSafe(outputStream, finPkt)
-                        break
-                    }
-                    if (read > 0) {
-                        if (maxSessionBytes != Long.MAX_VALUE && totalDownloadedBytes >= maxSessionBytes) {
-                            val rstPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x14, ByteArray(0))
-                            writeToTunSafe(outputStream, rstPkt)
-                            break
-                        }
-                        rateLimiter.acquire(read)
-                        totalDownloadedBytes += read
-                        totalBytesTransferred.addAndGet(read.toLong())
-                        val chunk = buffer.copyOf(read)
-                        val dataPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x18, chunk)
-                        mySeq = (mySeq + read) and 0xFFFFFFFFL
-                        writeToTunSafe(outputStream, dataPkt)
-                    }
-                }
-            } catch (_: Exception) {
-            } finally {
-                close()
-                tcpSessions.remove(key)
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        if (isServiceRunning) {
+            val restartIntent = Intent(applicationContext, MyVpnService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(restartIntent)
+            } else {
+                startService(restartIntent)
             }
         }
-
-        @Synchronized
-        fun sendToRemote(data: ByteArray, seq: Long) {
-            if (!connected || socket.isClosed) return
-            try {
-                lastActivityTime = System.currentTimeMillis()
-                if (seq == clientNextSeq) {
-                    rateLimiter.acquire(data.size)
-                    clientNextSeq = (seq + data.size) and 0xFFFFFFFFL
-                    socket.getOutputStream().write(data)
-                    socket.getOutputStream().flush()
-                    totalBytesTransferred.addAndGet(data.size.toLong())
-                }
-                val ackPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x10, ByteArray(0))
-                writeToTunSafe(outputStream, ackPkt)
-            } catch (_: Exception) {
-                close()
-            }
-        }
-
-        @Synchronized
-        fun handleClientFin(seq: Long) {
-            try {
-                clientNextSeq = (seq + 1) and 0xFFFFFFFFL
-                val finAck = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x11, ByteArray(0))
-                writeToTunSafe(outputStream, finAck)
-            } catch (_: Exception) {}
-            close()
-        }
-
-        fun close() {
-            connected = false
-            try {
-                socket.close()
-            } catch (_: Exception) {}
-        }
+        super.onTaskRemoved(rootIntent)
     }
 
-    private fun buildIcmpPortUnreachable(originalPacket: ByteArray, ipHeaderLen: Int): ByteArray? {
-        val quotedLen = (ipHeaderLen + 8).coerceAtMost(originalPacket.size)
-        if (quotedLen < 28) return null
-        val icmpLen = 8 + quotedLen
-        val totalLen = 20 + icmpLen
-        val buf = ByteBuffer.allocate(totalLen)
-
-        buf.put(0x45.toByte())
-        buf.put(0x00.toByte())
-        buf.putShort(totalLen.toShort())
-        buf.putShort(0)
-        buf.putShort(0x4000.toShort())
-        buf.put(64.toByte())
-        buf.put(1.toByte())
-        buf.putShort(0)
-        buf.put(originalPacket, 16, 4)
-        buf.put(originalPacket, 12, 4)
-        buf.putShort(10, computeChecksum(buf.array(), 0, 20))
-
-        buf.put(3.toByte())
-        buf.put(3.toByte())
-        buf.putShort(0)
-        buf.putInt(0)
-        buf.put(originalPacket, 0, quotedLen)
-        buf.putShort(22, computeChecksum(buf.array(), 20, icmpLen))
-
-        return buf.array()
+    override fun onRevoke() {
+        stopVpn()
+        super.onRevoke()
     }
 
-    private fun buildUdpIpPacket(srcIp: ByteArray, srcPort: Int, dstIp: ByteArray, dstPort: Int, payload: ByteArray): ByteArray {
-        val udpLen = 8 + payload.size
-        val totalLen = 20 + udpLen
-        val buf = ByteBuffer.allocate(totalLen)
-
-        buf.put(0x45.toByte())
-        buf.put(0x00.toByte())
-        buf.putShort(totalLen.toShort())
-        buf.putShort(0)
-        buf.putShort(0x4000.toShort())
-        buf.put(64.toByte())
-        buf.put(17.toByte())
-        buf.putShort(0)
-        buf.put(srcIp)
-        buf.put(dstIp)
-
-        val ipChecksum = computeChecksum(buf.array(), 0, 20)
-        buf.putShort(10, ipChecksum)
-
-        buf.putShort(srcPort.toShort())
-        buf.putShort(dstPort.toShort())
-        buf.putShort(udpLen.toShort())
-        buf.putShort(0)
-        buf.put(payload)
-
-        return buf.array()
-    }
-
-    private fun buildTcpIpPacket(
-        srcIp: ByteArray,
-        srcPort: Int,
-        dstIp: ByteArray,
-        dstPort: Int,
-        seq: Long,
-        ack: Long,
-        flags: Int,
-        payload: ByteArray
-    ): ByteArray {
-        val totalLen = 40 + payload.size
-        val buf = ByteBuffer.allocate(totalLen)
-
-        buf.put(0x45.toByte())
-        buf.put(0x00.toByte())
-        buf.putShort(totalLen.toShort())
-        buf.putShort(0)
-        buf.putShort(0x4000.toShort())
-        buf.put(64.toByte())
-        buf.put(6.toByte())
-        buf.putShort(0)
-        buf.put(srcIp)
-        buf.put(dstIp)
-
-        val ipChecksum = computeChecksum(buf.array(), 0, 20)
-        buf.putShort(10, ipChecksum)
-
-        buf.putShort(srcPort.toShort())
-        buf.putShort(dstPort.toShort())
-        buf.putInt(seq.toInt())
-        buf.putInt(ack.toInt())
-        buf.put(0x50.toByte())
-        buf.put(flags.toByte())
-        buf.putShort(4096.toShort())
-        buf.putShort(0)
-        buf.putShort(0)
-        buf.put(payload)
-
-        val tcpChecksum = computeTcpChecksum(srcIp, dstIp, buf.array(), 20, 20 + payload.size)
-        buf.putShort(36, tcpChecksum)
-
-        return buf.array()
-    }
-
-    private fun computeChecksum(data: ByteArray, offset: Int, length: Int): Short {
-        var sum = 0L
-        var i = offset
-        while (i < offset + length - 1) {
-            sum += ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
-            i += 2
+    override fun onDestroy() {
+        if (!isServiceRunning) {
+            cleanupTunnel()
+            releaseWakeLock()
         }
-        if (length % 2 == 1) {
-            sum += (data[offset + length - 1].toInt() and 0xFF) shl 8
-        }
-        while ((sum shr 16) != 0L) {
-            sum = (sum and 0xFFFF) + (sum shr 16)
-        }
-        return (sum.inv() and 0xFFFF).toShort()
-    }
-
-    private fun computeTcpChecksum(srcIp: ByteArray, dstIp: ByteArray, data: ByteArray, tcpOffset: Int, tcpLength: Int): Short {
-        var sum = 0L
-        for (i in 0 until 4 step 2) {
-            sum += ((srcIp[i].toInt() and 0xFF) shl 8) or (srcIp[i + 1].toInt() and 0xFF)
-            sum += ((dstIp[i].toInt() and 0xFF) shl 8) or (dstIp[i + 1].toInt() and 0xFF)
-        }
-        sum += 6L
-        sum += tcpLength.toLong()
-
-        var i = tcpOffset
-        while (i < tcpOffset + tcpLength - 1) {
-            sum += ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
-            i += 2
-        }
-        if (tcpLength % 2 == 1) {
-            sum += (data[tcpOffset + tcpLength - 1].toInt() and 0xFF) shl 8
-        }
-        while ((sum shr 16) != 0L) {
-            sum = (sum and 0xFFFF) + (sum shr 16)
-        }
-        return (sum.inv() and 0xFFFF).toShort()
+        super.onDestroy()
     }
 }
