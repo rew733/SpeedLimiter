@@ -15,6 +15,7 @@ import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
@@ -30,6 +31,8 @@ class PacketForwarder(
     private val cleaner: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
     private val tcpSessions = ConcurrentHashMap<String, TcpSession>()
     private val uidSessionMap = ConcurrentHashMap<String, Int>()
+    // قصر القنوات المتزامنة لتوجيه النطاق الترددي نحو الفيديو قيد التشغيل وتقليل التحميل المسبق للخلفية
+    private val connectionSlots = Semaphore(3)
     @Volatile private var running = false
     @Volatile var isScreenOn = true
     @Volatile var activeForegroundUid: Int = Process.INVALID_UID
@@ -139,9 +142,26 @@ class PacketForwarder(
         }
     }
 
+    /**
+     * حظر صارم لحزم التطبيقات في الخلفية:
+     * - عند إطفاء الشاشة: حظر كامل.
+     * - عند معرفة UID لتطبيق مستخدم: يُحظر إذا كان ضمن blockedUids أو (عند وجود قائمة allowedUids أو تحديد تطبيق نشط في الواجهة) لم يكن ضمن allowedUids أو activeForegroundUid.
+     * - خدمات النظام الأساسية (uid < FIRST_APPLICATION_UID) تمر دون تعطيل الجهاز.
+     */
     private fun isUidBlockedInBackground(uid: Int): Boolean {
         if (!isScreenOn) return true
         if (uid == Process.INVALID_UID || uid < Process.FIRST_APPLICATION_UID) return false
+
+        if (blockedUids.contains(uid)) return true
+
+        if (hasUsagePermission && activeForegroundUid != Process.INVALID_UID) {
+            return uid != activeForegroundUid
+        }
+
+        if (allowedUids.isNotEmpty()) {
+            return !allowedUids.contains(uid)
+        }
+
         return false
     }
 
@@ -487,10 +507,11 @@ class PacketForwarder(
     ) {
         private val socket = Socket()
         private var mySeq: Long = 10000L
-        private var clientNextSeq: Long = (initialSeq + 1) and 0xFFFFFFFFL
+        private var clientNextSeq: Long = (initialClientSeq + 1) and 0xFFFFFFFFL
         private var totalDownloadedBytes: Long = 0L
         @Volatile var lastActivityTime: Long = System.currentTimeMillis()
         @Volatile private var connected = false
+        @Volatile private var slotAcquired = false
 
         fun resendSynAckIfReady() {
             if (connected) {
@@ -502,12 +523,15 @@ class PacketForwarder(
         fun connect() {
             try {
                 if (!isUidPermittedNow(ownerUid)) return
+                connectionSlots.acquire()
+                slotAcquired = true
+
                 vpnService.protect(socket)
                 socket.tcpNoDelay = true
                 socket.soTimeout = 60000
-                socket.receiveBufferSize = 32768
-                socket.sendBufferSize = 16384
-                socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 15000)
+                socket.receiveBufferSize = 2048
+                socket.sendBufferSize = 4096
+                socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 12000)
                 connected = true
                 lastActivityTime = System.currentTimeMillis()
 
@@ -516,7 +540,7 @@ class PacketForwarder(
                 writeToTunSafe(outputStream, synAck)
 
                 val inStream = socket.getInputStream()
-                val buffer = ByteArray(1400)
+                val buffer = ByteArray(1024)
                 while (running && connected && !socket.isClosed) {
                     if (!isUidPermittedNow(ownerUid)) {
                         val rstPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x14, ByteArray(0))
@@ -588,6 +612,10 @@ class PacketForwarder(
 
         fun close() {
             connected = false
+            if (slotAcquired) {
+                slotAcquired = false
+                try { connectionSlots.release() } catch (_: Exception) {}
+            }
             try {
                 socket.close()
             } catch (_: Exception) {}
@@ -655,7 +683,7 @@ class PacketForwarder(
         buf.putInt(ack.toInt())
         buf.put(0x50.toByte())
         buf.put(flags.toByte())
-        buf.putShort(32768.toShort())
+        buf.putShort(2048.toShort())
         buf.putShort(0)
         buf.putShort(0)
         buf.put(payload)
