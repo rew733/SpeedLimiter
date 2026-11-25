@@ -223,7 +223,7 @@ class PacketForwarder(
                     if (read > 0) {
                         if (maxSessionBytes != Long.MAX_VALUE && totalDownloadedBytes >= maxSessionBytes) {
                             val rstPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x14, ByteArray(0))
-                            writeToTun(outputStream, rstPkt)
+                            writeToTun(rstPkt)
                             break
                         }
                         rateLimiter.acquire(read)
