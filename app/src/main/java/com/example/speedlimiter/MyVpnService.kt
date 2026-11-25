@@ -8,7 +8,6 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.net.ConnectivityManager
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -75,14 +74,22 @@ class MyVpnService : VpnService() {
         currentLimitKb = speedKb
         savedBgKillPackages = bgKillPackages
 
-        val activeSpeedPackages = targetPackages.filter { !bgKillPackages.contains(it) && it != packageName }
+        // ضم التطبيقات المحددة + تطبيقات حظر الخلفية + خدمات نقل البيانات الخلفية داخل النفق المقيد
+        val tunnelPackages = LinkedHashSet<String>().apply {
+            addAll(targetPackages)
+            addAll(bgKillPackages)
+            add("com.google.android.gms")
+            add("com.android.vending")
+            add("com.android.providers.downloads")
+            remove(packageName)
+        }.toList()
 
         killBackgroundProcesses(bgKillPackages)
 
         cleanupTunnel()
         acquireWakeLock()
         startForegroundNotification(buildNotification(0.0, 0.0, 0))
-        startVpn(activeSpeedPackages, bgKillPackages, speedKb, sessionLimitKb)
+        startVpn(tunnelPackages, speedKb, sessionLimitKb)
         startLiveMonitor()
         startAutoRefreshTimer()
         startBackgroundEnforcer()
@@ -195,19 +202,6 @@ class MyVpnService : VpnService() {
         } catch (_: Exception) {}
     }
 
-    private fun resolveBlockedUids(packages: List<String>): Set<Int> {
-        val uids = HashSet<Int>()
-        val pm = packageManager
-        for (pkg in packages) {
-            if (pkg == packageName) continue
-            try {
-                val appInfo = pm.getApplicationInfo(pkg, 0)
-                uids.add(appInfo.uid)
-            } catch (_: Exception) {}
-        }
-        return uids
-    }
-
     private fun acquireWakeLock() {
         try {
             if (wakeLock == null) {
@@ -227,12 +221,7 @@ class MyVpnService : VpnService() {
         } catch (_: Exception) {}
     }
 
-    private fun startVpn(
-        allowedSpeedPackages: List<String>,
-        blockedBgPackages: List<String>,
-        speedKb: Int,
-        sessionLimitKb: Int
-    ) {
+    private fun startVpn(targetPackages: List<String>, speedKb: Int, sessionLimitKb: Int) {
         isServiceRunning = true
         getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE).edit()
             .putBoolean("is_running", true).apply()
@@ -240,19 +229,8 @@ class MyVpnService : VpnService() {
         val limiter = RateLimiter(speedKb.toLong() * 1024L)
         rateLimiter = limiter
         val maxSessionBytes = if (sessionLimitKb > 0) sessionLimitKb.toLong() * 1024L else Long.MAX_VALUE
+        packetForwarder = PacketForwarder(this, limiter, maxSessionBytes)
 
-        val blockedUids = resolveBlockedUids(blockedBgPackages)
-        val connManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-
-        packetForwarder = PacketForwarder(
-            vpnService = this,
-            rateLimiter = limiter,
-            maxSessionBytes = maxSessionBytes,
-            blockedUids = blockedUids,
-            connectivityManager = connManager
-        )
-
-        // IPv4 فقط لإجبار جميع التطبيقات على استخدام مكدس IPv4 المُقيّد ومنع الالتفاف عبر IPv6
         val builder = Builder()
             .setSession("SpeedLimiter")
             .addAddress("10.0.0.2", 32)
@@ -262,18 +240,9 @@ class MyVpnService : VpnService() {
             .setMtu(1400)
             .setBlocking(true)
 
-        val essentialSystemExceptions = setOf(
-            packageName,
-            "com.android.phone",
-            "com.android.mms",
-            "com.android.server.telecom",
-            "com.android.providers.telephony"
-        )
-
-        for (excludedPkg in essentialSystemExceptions) {
-            try {
-                builder.addDisallowedApplication(excludedPkg)
-            } catch (_: Exception) {}
+        for (pkg in targetPackages) {
+            if (pkg == packageName) continue
+            try { builder.addAllowedApplication(pkg) } catch (_: Exception) {}
         }
 
         vpnInterface = builder.establish()
