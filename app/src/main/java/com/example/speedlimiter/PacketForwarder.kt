@@ -22,13 +22,17 @@ class PacketForwarder(
     private val vpnService: VpnService,
     private val rateLimiter: RateLimiter,
     private val maxSessionBytes: Long = Long.MAX_VALUE,
+    private val allowedUids: Set<Int> = emptySet(),
     private val blockedUids: Set<Int> = emptySet(),
     private val connectivityManager: ConnectivityManager? = null
 ) {
     private val executor = Executors.newCachedThreadPool()
     private val cleaner: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
     private val tcpSessions = ConcurrentHashMap<String, TcpSession>()
+    private val uidSessionMap = ConcurrentHashMap<String, Int>()
     @Volatile private var running = false
+    @Volatile var isScreenOn = true
+    @Volatile var activeForegroundUid: Int = Process.INVALID_UID
 
     val totalBytesTransferred = AtomicLong(0L)
 
@@ -40,12 +44,16 @@ class PacketForwarder(
             val it = tcpSessions.entries.iterator()
             while (it.hasNext()) {
                 val entry = it.next()
-                if (now - entry.value.lastActivityTime > 60_000L) {
+                val sessionUid = uidSessionMap[entry.key] ?: Process.INVALID_UID
+                val expired = now - entry.value.lastActivityTime > 45_000L
+                val noLongerForeground = !isScreenOn || !isUidPermittedNow(sessionUid)
+                if (expired || noLongerForeground) {
                     entry.value.close()
                     it.remove()
+                    uidSessionMap.remove(entry.key)
                 }
             }
-        }, 20, 20, TimeUnit.SECONDS)
+        }, 3, 3, TimeUnit.SECONDS)
 
         val packet = ByteBuffer.allocate(32767)
 
@@ -67,14 +75,26 @@ class PacketForwarder(
         }
     }
 
+    fun closeAllSessionsImmediately() {
+        val it = tcpSessions.entries.iterator()
+        while (it.hasNext()) {
+            val entry = it.next()
+            entry.value.close()
+            it.remove()
+        }
+        uidSessionMap.clear()
+    }
+
     fun refreshSessions() {
         val now = System.currentTimeMillis()
         val it = tcpSessions.entries.iterator()
         while (it.hasNext()) {
             val entry = it.next()
-            if (now - entry.value.lastActivityTime > 30_000L) {
+            val sessionUid = uidSessionMap[entry.key] ?: Process.INVALID_UID
+            if (now - entry.value.lastActivityTime > 20_000L || !isScreenOn || !isUidPermittedNow(sessionUid)) {
                 entry.value.close()
                 it.remove()
+                uidSessionMap.remove(entry.key)
             }
         }
     }
@@ -82,39 +102,61 @@ class PacketForwarder(
     fun stop() {
         running = false
         try { cleaner.shutdownNow() } catch (_: Exception) {}
-        val it = tcpSessions.entries.iterator()
-        while (it.hasNext()) {
-            val entry = it.next()
-            entry.value.close()
-            it.remove()
-        }
+        closeAllSessionsImmediately()
         try { executor.shutdownNow() } catch (_: Exception) {}
     }
 
-    private fun isPacketFromBlockedApp(
+    private fun resolvePacketOwnerUid(
         protocol: Int,
         srcIp: ByteArray,
         srcPort: Int,
         dstIp: ByteArray,
         dstPort: Int
-    ): Boolean {
-        if (blockedUids.isEmpty() || connectivityManager == null) return false
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
+    ): Int {
+        if (connectivityManager == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return Process.INVALID_UID
+        }
         return try {
             val local = InetSocketAddress(InetAddress.getByAddress(srcIp), srcPort)
             val remote = InetSocketAddress(InetAddress.getByAddress(dstIp), dstPort)
-            val uid = connectivityManager.getConnectionOwnerUid(protocol, local, remote)
-            uid != Process.INVALID_UID && blockedUids.contains(uid)
+            connectivityManager.getConnectionOwnerUid(protocol, local, remote)
         } catch (_: Exception) {
-            false
+            Process.INVALID_UID
         }
+    }
+
+    /**
+     * قاعدة الرفض الافتراضي (Default-Deny) + التقييد بالواجهة المباشرة فقط:
+     * 1. إذا كانت الشاشة مغلقة -> رفض كامل.
+     * 2. إذا كان المالك غير معروف (INVALID_UID) -> رفض كامل لمنع أي تسرب خفي.
+     * 3. إذا كان التطبيق ضمن قائمة حظر الخلفية (blockedUids) -> رفض كامل.
+     * 4. إذا كان تطبيق مستخدم، يجب أن يكون ضمن allowedUids وأن يكون هو التطبيق النشط حالياً في المقدمة (activeForegroundUid).
+     * 5. خدمات النظام الأساسية فقط (uid < FIRST_APPLICATION_UID) تمر بحد السرعة عند الحاجة دون المساس باستقرار الجهاز.
+     */
+    private fun isUidPermittedNow(uid: Int): Boolean {
+        if (!isScreenOn) return false
+        if (uid == Process.INVALID_UID) return false
+        if (blockedUids.contains(uid)) return false
+
+        if (uid < Process.FIRST_APPLICATION_UID) {
+            return true
+        }
+
+        if (!allowedUids.contains(uid)) {
+            return false
+        }
+
+        if (activeForegroundUid != Process.INVALID_UID && uid != activeForegroundUid) {
+            return false
+        }
+
+        return true
     }
 
     private fun handleOutgoingPacket(rawPacket: ByteArray, outputStream: FileOutputStream) {
         if (rawPacket.size < 20) return
         val version = (rawPacket[0].toInt() shr 4) and 0x0F
 
-        // إجبار التطبيقات على التحول الفوري من IPv6 إلى IPv4 المُقيّد
         if (version == 6) {
             handleIpv6Packet(rawPacket, outputStream)
             return
@@ -262,7 +304,8 @@ class PacketForwarder(
         val srcPort = ((rawPacket[ipHeaderLen].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 1].toInt() and 0xFF)
         val dstPort = ((rawPacket[ipHeaderLen + 2].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 3].toInt() and 0xFF)
 
-        if (isPacketFromBlockedApp(17, srcIp, srcPort, dstIp, dstPort)) {
+        val ownerUid = resolvePacketOwnerUid(17, srcIp, srcPort, dstIp, dstPort)
+        if (!isUidPermittedNow(ownerUid)) {
             return
         }
 
@@ -389,9 +432,11 @@ class PacketForwarder(
         val rst = (flags and 0x04) != 0
 
         val sessionKey = "${InetAddress.getByAddress(srcIp).hostAddress}:$srcPort-${InetAddress.getByAddress(dstIp).hostAddress}:$dstPort"
+        val ownerUid = resolvePacketOwnerUid(6, srcIp, srcPort, dstIp, dstPort)
 
-        if (isPacketFromBlockedApp(6, srcIp, srcPort, dstIp, dstPort)) {
+        if (!isUidPermittedNow(ownerUid)) {
             tcpSessions.remove(sessionKey)?.close()
+            uidSessionMap.remove(sessionKey)
             if (!rst) {
                 val nextSeq = (seqNum + 1) and 0xFFFFFFFFL
                 val rstPkt = buildTcpIpPacket(dstIp, dstPort, srcIp, srcPort, 0L, nextSeq, 0x14, ByteArray(0))
@@ -409,13 +454,15 @@ class PacketForwarder(
 
         if (rst) {
             tcpSessions.remove(sessionKey)?.close()
+            uidSessionMap.remove(sessionKey)
             return
         }
 
         if (syn && !ack) {
             tcpSessions.remove(sessionKey)?.close()
-            val session = TcpSession(sessionKey, srcIp, srcPort, dstIp, dstPort, seqNum, outputStream)
+            val session = TcpSession(sessionKey, ownerUid, srcIp, srcPort, dstIp, dstPort, seqNum, outputStream)
             tcpSessions[sessionKey] = session
+            uidSessionMap[sessionKey] = ownerUid
             executor.execute { session.connect() }
             return
         }
@@ -426,6 +473,7 @@ class PacketForwarder(
         if (fin) {
             session.handleClientFin(seqNum)
             tcpSessions.remove(sessionKey)
+            uidSessionMap.remove(sessionKey)
             return
         }
 
@@ -436,6 +484,7 @@ class PacketForwarder(
 
     inner class TcpSession(
         private val key: String,
+        private val ownerUid: Int,
         private val clientIp: ByteArray,
         private val clientPort: Int,
         private val remoteIp: ByteArray,
@@ -452,6 +501,7 @@ class PacketForwarder(
 
         fun connect() {
             try {
+                if (!isUidPermittedNow(ownerUid)) return
                 rateLimiter.acquire(512)
                 vpnService.protect(socket)
                 socket.tcpNoDelay = true
@@ -468,6 +518,11 @@ class PacketForwarder(
                 val inStream = socket.getInputStream()
                 val buffer = ByteArray(1200)
                 while (running && connected && !socket.isClosed) {
+                    if (!isUidPermittedNow(ownerUid)) {
+                        val rstPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x14, ByteArray(0))
+                        writeToTunSafe(outputStream, rstPkt)
+                        break
+                    }
                     val read = inStream.read(buffer)
                     lastActivityTime = System.currentTimeMillis()
                     if (read == -1) {
@@ -495,12 +550,17 @@ class PacketForwarder(
             } finally {
                 close()
                 tcpSessions.remove(key)
+                uidSessionMap.remove(key)
             }
         }
 
         @Synchronized
         fun sendToRemote(data: ByteArray, seq: Long) {
             if (!connected || socket.isClosed) return
+            if (!isUidPermittedNow(ownerUid)) {
+                close()
+                return
+            }
             try {
                 lastActivityTime = System.currentTimeMillis()
                 if (seq == clientNextSeq) {
