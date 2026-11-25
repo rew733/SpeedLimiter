@@ -252,12 +252,11 @@ class MyVpnService : VpnService() {
             connectivityManager = connManager
         )
 
+        // IPv4 فقط لإجبار جميع التطبيقات على استخدام مكدس IPv4 المُقيّد ومنع الالتفاف عبر IPv6
         val builder = Builder()
             .setSession("SpeedLimiter")
             .addAddress("10.0.0.2", 32)
             .addRoute("0.0.0.0", 0)
-            .addAddress("fd00:1:fd00:1:fd00:1:fd00:1", 128)
-            .addRoute("::", 0)
             .addDnsServer("8.8.8.8")
             .addDnsServer("1.1.1.1")
             .setMtu(1400)
