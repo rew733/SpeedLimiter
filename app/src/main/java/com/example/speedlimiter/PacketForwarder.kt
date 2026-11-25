@@ -1,4 +1,4 @@
-packet_forwarder_code = """package com.example.speedlimiter
+package com.example.speedlimiter
 
 import android.net.ConnectivityManager
 import android.net.VpnService
@@ -138,7 +138,6 @@ class PacketForwarder(
         val srcPort = ((rawPacket[ipHeaderLen].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 1].toInt() and 0xFF)
         val dstPort = ((rawPacket[ipHeaderLen + 2].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 3].toInt() and 0xFF)
 
-        // Zero-Data Blackhole: إسقاط فوري لأي حزمة UDP صادرة من تطبيقات حظر الخلفية
         if (isPacketFromBlockedApp(17, srcIp, srcPort, dstIp, dstPort)) {
             return
         }
@@ -267,7 +266,6 @@ class PacketForwarder(
 
         val sessionKey = "${InetAddress.getByAddress(srcIp).hostAddress}:$srcPort-${InetAddress.getByAddress(dstIp).hostAddress}:$dstPort"
 
-        // Zero-Data Blackhole: منع أي حزمة TCP صادرة من تطبيقات حظر الخلفية وإرسال RST فوري لإنهاء المحاولة
         if (isPacketFromBlockedApp(6, srcIp, srcPort, dstIp, dstPort)) {
             tcpSessions.remove(sessionKey)?.close()
             if (!rst) {
@@ -553,9 +551,3 @@ class PacketForwarder(
         return (sum.inv() and 0xFFFF).toShort()
     }
 }
-"""
-
-with open("PacketForwarder.kt", "w", encoding="utf-8") as f:
-    f.write(packet_forwarder_code)
-
-print("PacketForwarder.kt generated successfully")
