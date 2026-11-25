@@ -9,6 +9,8 @@ import android.graphics.Typeface
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.text.InputType
 import android.widget.Button
 import android.widget.CheckBox
@@ -22,11 +24,16 @@ class MainActivity : Activity() {
 
     private val vpnRequestCode = 1001
     private var isVpnActive = false
+    private var isRefreshing = false
+
     private lateinit var toggleButton: Button
     private lateinit var selectAllButton: Button
+    private lateinit var refreshButton: Button
     private lateinit var speedInput: EditText
     private lateinit var statusText: TextView
+    private lateinit var appsListLayout: LinearLayout
 
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val allUserPackages = mutableListOf<String>()
     private val checkBoxes = mutableListOf<CheckBox>()
     private val selectedPackages = mutableSetOf<String>()
@@ -91,38 +98,42 @@ class MainActivity : Activity() {
         val btnParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = 16; bottomMargin = 12 }
+        ).apply { topMargin = 16; bottomMargin = 10 }
         rootLayout.addView(toggleButton, btnParams)
+
+        val actionRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = 16 }
+        }
 
         selectAllButton = Button(this).apply {
             text = "تحديد الكل"
-            textSize = 15f
+            textSize = 14f
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = 8
+            }
             setOnClickListener {
-                val shouldSelectAll = selectedPackages.size < allUserPackages.size
-                selectedPackages.clear()
-                for (i in checkBoxes.indices) {
-                    val cb = checkBoxes[i]
-                    cb.setOnCheckedChangeListener(null)
-                    cb.isChecked = shouldSelectAll
-                    if (shouldSelectAll && i < allUserPackages.size) {
-                        selectedPackages.add(allUserPackages[i])
-                    }
-                    val pkg = allUserPackages.getOrNull(i)
-                    if (pkg != null) {
-                        cb.setOnCheckedChangeListener { _, isChecked ->
-                            if (isChecked) selectedPackages.add(pkg) else selectedPackages.remove(pkg)
-                            updateSelectAllButtonLabel()
-                        }
-                    }
-                }
-                updateSelectAllButtonLabel()
+                toggleSelectAll()
             }
         }
-        val selectAllParams = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { bottomMargin = 16 }
-        rootLayout.addView(selectAllButton, selectAllParams)
+        actionRow.addView(selectAllButton)
+
+        refreshButton = Button(this).apply {
+            text = "تحديث داخلي"
+            textSize = 14f
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = 8
+            }
+            setOnClickListener {
+                performInternalRefresh()
+            }
+        }
+        actionRow.addView(refreshButton)
+
+        rootLayout.addView(actionRow)
 
         val appsHeader = TextView(this).apply {
             text = "قائمة التطبيقات المثبتة (غير النظامية):"
@@ -141,9 +152,45 @@ class MainActivity : Activity() {
             )
         }
 
-        val appsListLayout = LinearLayout(this).apply {
+        appsListLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
+
+        scrollView.addView(appsListLayout)
+        rootLayout.addView(scrollView)
+
+        setContentView(rootLayout)
+        loadInstalledApps()
+    }
+
+    private fun performInternalRefresh() {
+        if (isRefreshing) return
+        isRefreshing = true
+        refreshButton.isEnabled = false
+        selectAllButton.isEnabled = false
+
+        mainHandler.removeCallbacksAndMessages(null)
+        statusText.text = "جاري التحديث الداخلي وتصفية الأوامر..."
+
+        loadInstalledApps {
+            isRefreshing = false
+            refreshButton.isEnabled = true
+            selectAllButton.isEnabled = true
+            statusText.text = if (isVpnActive) {
+                val speedKbps = speedInput.text.toString().toLongOrNull() ?: 150L
+                "الحالة: نشط — الحد: $speedKbps KB/s | التطبيقات المحددة: ${selectedPackages.size}"
+            } else {
+                "الحالة: متوقف (تم التحديث الداخلي)"
+            }
+            Toast.makeText(this, "تم التحديث الداخلي بنجاح", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun loadInstalledApps(onDone: (() -> Unit)? = null) {
+        allUserPackages.clear()
+        checkBoxes.clear()
+        selectedPackages.clear()
+        appsListLayout.removeAllViews()
 
         val pm = packageManager
         val installedApps: List<ApplicationInfo> = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -180,10 +227,26 @@ class MainActivity : Activity() {
             appsListLayout.addView(checkBox)
         }
 
-        scrollView.addView(appsListLayout)
-        rootLayout.addView(scrollView)
+        updateSelectAllButtonLabel()
+        onDone?.invoke()
+    }
 
-        setContentView(rootLayout)
+    private fun toggleSelectAll() {
+        val shouldSelectAll = selectedPackages.size < allUserPackages.size
+        selectedPackages.clear()
+        for (i in checkBoxes.indices) {
+            val cb = checkBoxes[i]
+            val pkg = allUserPackages.getOrNull(i) ?: continue
+            cb.setOnCheckedChangeListener(null)
+            cb.isChecked = shouldSelectAll
+            if (shouldSelectAll) {
+                selectedPackages.add(pkg)
+            }
+            cb.setOnCheckedChangeListener { _, isChecked ->
+                if (isChecked) selectedPackages.add(pkg) else selectedPackages.remove(pkg)
+                updateSelectAllButtonLabel()
+            }
+        }
         updateSelectAllButtonLabel()
     }
 
