@@ -160,7 +160,7 @@ class MainActivity : Activity() {
         rootLayout.addView(scrollView)
 
         setContentView(rootLayout)
-        loadInstalledApps()
+        loadInstalledApps(preserveSelection = false)
     }
 
     private fun performInternalRefresh() {
@@ -170,23 +170,23 @@ class MainActivity : Activity() {
         selectAllButton.isEnabled = false
 
         mainHandler.removeCallbacksAndMessages(null)
-        statusText.text = "جاري التحديث الداخلي وتصفية الأوامر..."
+        statusText.text = "جاري التحديث الداخلي وتجديد الجلسة..."
 
-        loadInstalledApps {
+        loadInstalledApps(preserveSelection = true) {
+            if (isVpnActive) {
+                startSpeedLimiterVpn(showToast = false)
+            } else {
+                statusText.text = "الحالة: متوقف (تم التحديث الداخلي | المحدد: ${selectedPackages.size})"
+            }
             isRefreshing = false
             refreshButton.isEnabled = true
             selectAllButton.isEnabled = true
-            statusText.text = if (isVpnActive) {
-                val speedKbps = speedInput.text.toString().toLongOrNull() ?: 150L
-                "الحالة: نشط — الحد: $speedKbps KB/s | التطبيقات المحددة: ${selectedPackages.size}"
-            } else {
-                "الحالة: متوقف (تم التحديث الداخلي)"
-            }
             Toast.makeText(this, "تم التحديث الداخلي بنجاح", Toast.LENGTH_SHORT).show()
         }
     }
 
-    private fun loadInstalledApps(onDone: (() -> Unit)? = null) {
+    private fun loadInstalledApps(preserveSelection: Boolean, onDone: (() -> Unit)? = null) {
+        val previousSelection = if (preserveSelection) selectedPackages.toSet() else emptySet()
         allUserPackages.clear()
         checkBoxes.clear()
         selectedPackages.clear()
@@ -214,10 +214,16 @@ class MainActivity : Activity() {
             val pkgName = appInfo.packageName
             allUserPackages.add(pkgName)
 
+            val wasChecked = previousSelection.contains(pkgName)
+            if (wasChecked) {
+                selectedPackages.add(pkgName)
+            }
+
             val checkBox = CheckBox(this).apply {
                 text = "$label ($pkgName)"
                 textSize = 14f
                 setTextColor(Color.BLACK)
+                isChecked = wasChecked
                 setOnCheckedChangeListener { _, isChecked ->
                     if (isChecked) selectedPackages.add(pkgName) else selectedPackages.remove(pkgName)
                     updateSelectAllButtonLabel()
@@ -266,17 +272,23 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun startSpeedLimiterVpn() {
+    private fun startSpeedLimiterVpn(showToast: Boolean = true) {
         val speedKbps = speedInput.text.toString().toLongOrNull() ?: 150L
         val intent = Intent(this, MyVpnService::class.java).apply {
             putExtra(MyVpnService.EXTRA_SPEED_KBPS, speedKbps)
             putStringArrayListExtra(MyVpnService.EXTRA_SELECTED_PACKAGES, ArrayList(selectedPackages))
         }
-        startService(intent)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
         isVpnActive = true
         toggleButton.text = "إيقاف SpeedLimiter VPN"
         statusText.text = "الحالة: نشط — الحد: $speedKbps KB/s | التطبيقات المحددة: ${selectedPackages.size}"
-        Toast.makeText(this, "تم بدء الخدمة بحد $speedKbps KB/s", Toast.LENGTH_SHORT).show()
+        if (showToast) {
+            Toast.makeText(this, "تم بدء الخدمة بحد $speedKbps KB/s", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun stopSpeedLimiterVpn() {
@@ -284,7 +296,6 @@ class MainActivity : Activity() {
             action = MyVpnService.ACTION_STOP
         }
         startService(stopIntent)
-        stopService(Intent(this, MyVpnService::class.java))
         isVpnActive = false
         toggleButton.text = "تشغيل SpeedLimiter VPN"
         statusText.text = "الحالة: متوقف"
