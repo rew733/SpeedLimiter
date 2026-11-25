@@ -142,12 +142,6 @@ class PacketForwarder(
     private fun isUidBlockedInBackground(uid: Int): Boolean {
         if (!isScreenOn) return true
         if (uid == Process.INVALID_UID || uid < Process.FIRST_APPLICATION_UID) return false
-
-        if (hasUsagePermission && activeForegroundUid != Process.INVALID_UID) {
-            return uid != activeForegroundUid
-        }
-
-        if (blockedUids.contains(uid)) return true
         return false
     }
 
