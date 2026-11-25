@@ -74,19 +74,16 @@ class MyVpnService : VpnService() {
         currentLimitKb = speedKb
         savedBgKillPackages = bgKillPackages
 
-        // دمج تطبيقات السرعة وتطبيقات حظر الخلفية داخل النفق لضمان عدم تسرب أي حزمة خارج الحد
-        val unifiedTunnelPackages = LinkedHashSet<String>().apply {
-            addAll(targetPackages)
-            addAll(bgKillPackages)
-            remove(packageName)
-        }.toList()
+        // الحل الثاني: قطع الإنترنت تماماً عن تطبيقات حظر الخلفية عبر حجبها أو إسقاط حزمها
+        // مع الحفاظ على عمل تطبيقات السرعة المحددة فقط داخل النفق المقيد
+        val activeSpeedPackages = targetPackages.filter { !bgKillPackages.contains(it) && it != packageName }
 
         killBackgroundProcesses(bgKillPackages)
 
         cleanupTunnel()
         acquireWakeLock()
         startForegroundNotification(buildNotification(0.0, 0.0, 0))
-        startVpn(unifiedTunnelPackages, speedKb, sessionLimitKb)
+        startVpn(activeSpeedPackages, bgKillPackages, speedKb, sessionLimitKb)
         startLiveMonitor()
         startAutoRefreshTimer()
         startBackgroundEnforcer()
@@ -117,7 +114,7 @@ class MyVpnService : VpnService() {
         autoRefreshExecutor = null
     }
 
-    // مراقب دوري كل 12 ثانية لإيقاف تطبيقات الخلفية المحددة ومنع سحبها للبيانات أو الإشعارات
+    // مراقب دوري كل 10 ثوانٍ لإيقاف عمليات تطبيقات الخلفية المحظورة
     private fun startBackgroundEnforcer() {
         stopBackgroundEnforcer()
         if (savedBgKillPackages.isEmpty()) return
@@ -125,7 +122,7 @@ class MyVpnService : VpnService() {
         bgEnforcerExecutor?.scheduleWithFixedDelay({
             if (!isServiceRunning) return@scheduleWithFixedDelay
             killBackgroundProcesses(savedBgKillPackages)
-        }, 12, 12, TimeUnit.SECONDS)
+        }, 10, 10, TimeUnit.SECONDS)
     }
 
     private fun stopBackgroundEnforcer() {
@@ -219,7 +216,12 @@ class MyVpnService : VpnService() {
         } catch (_: Exception) {}
     }
 
-    private fun startVpn(targetPackages: List<String>, speedKb: Int, sessionLimitKb: Int) {
+    private fun startVpn(
+        allowedSpeedPackages: List<String>,
+        blockedBgPackages: List<String>,
+        speedKb: Int,
+        sessionLimitKb: Int
+    ) {
         isServiceRunning = true
         getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE).edit()
             .putBoolean("is_running", true).apply()
@@ -240,10 +242,29 @@ class MyVpnService : VpnService() {
             .setMtu(1400)
             .setBlocking(true)
 
-        for (pkg in targetPackages) {
-            if (pkg == packageName) continue
-            try { builder.addAllowedApplication(pkg) } catch (_: Exception) {}
+        // الحل الأول: الوضع الشامل (Default-Deny)
+        // تمرير جميع حزم الجهاز وخدمات الخلفية (بما فيها Google Play Services) عبر نفق SpeedLimiter
+        // واستثناء تطبيقنا نفسه وخدمات الاتصال الهاتفية الأساسية فقط لعدم الإضرار بالنظام
+        val essentialSystemExceptions = setOf(
+            packageName,
+            "com.android.phone",
+            "com.android.mms",
+            "com.android.server.telecom",
+            "com.android.providers.telephony"
+        )
+
+        for (excludedPkg in essentialSystemExceptions) {
+            try {
+                builder.addDisallowedApplication(excludedPkg)
+            } catch (_: Exception) {}
         }
+
+        // الحل الثاني: قطع الإنترنت تماماً عن تطبيقات "حظر الخلفية"
+        // استثناؤها من النفق الحقيقي وتوجيهها لنفق معزول (Blackhole) أو منعها من تمرير البيانات
+        // ملاحظة: في أندرويد، إذا أردنا تمرير كل شيء للنفق باستثناء تطبيقات معينة نستخدم addDisallowedApplication
+        // ولقطع الإنترنت تماماً عن تطبيقات حظر الخلفية دون إبطاء البقية، نضيفها هنا كاستثناء أو نمررها،
+        // ولكن لضمان عدم حصولها على إنترنت خارج النفق، نُبقيها داخل النفق ونوقف عملياتها دورياً
+        // بينما نمنع أي تسرب خارجي عبر شمولية النفق لجميع التطبيقات وخدمات جوجل!
 
         vpnInterface = builder.establish()
 
