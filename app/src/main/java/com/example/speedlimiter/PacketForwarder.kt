@@ -125,18 +125,13 @@ class PacketForwarder(
         }
     }
 
-    /**
-     * قاعدة الرفض الافتراضي (Default-Deny) + التقييد بالواجهة المباشرة مع التحصين ضد غياب إذن Usage Access:
-     * 1. إذا كانت الشاشة مغلقة -> رفض كامل.
-     * 2. إذا كان المالك غير معروف (INVALID_UID) -> رفض كامل لمنع أي تسرب خفي.
-     * 3. إذا كان التطبيق ضمن قائمة حظر الخلفية (blockedUids) -> رفض كامل.
-     * 4. إذا كان تطبيق مستخدم: يجب أن يكون ضمن allowedUids، وإذا تم التعرف على التطبيق النشط في المقدمة
-     *    (activeForegroundUid != INVALID_UID) يجب أن يطابقه، أما إذا لم يُمنح الإذن فتعمل قائمة السرعة دون انقطاع.
-     * 5. خدمات النظام الأساسية فقط (uid < FIRST_APPLICATION_UID) تمر بحد السرعة عند الحاجة دون المساس باستقرار الجهاز.
-     */
     private fun isUidPermittedNow(uid: Int): Boolean {
         if (!isScreenOn) return false
-        if (uid == Process.INVALID_UID) return false
+
+        // السماح بالمرور عبر النفق المقيد إذا لم يتمكن النظام من تحديد UID الحزمة
+        // لتجنب قطع الإنترنت كلياً عن الجهاز مع استمرار عمل قاتل الخلفية كل ثانيتين
+        if (uid == Process.INVALID_UID) return true
+
         if (blockedUids.contains(uid)) return false
 
         if (uid < Process.FIRST_APPLICATION_UID) {
