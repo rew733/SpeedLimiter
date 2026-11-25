@@ -181,7 +181,6 @@ class MyVpnService : VpnService() {
                 val usm = getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
                 if (usm != null) {
                     val now = System.currentTimeMillis()
-                    // البحث في آخر 15 دقيقة حتى لا يفقد التطبيق المفتوح إذا بقي المستخدم بداخله طويلاً
                     val events = usm.queryEvents(now - 900_000L, now)
                     val event = UsageEvents.Event()
                     var latestPkg: String? = null
@@ -242,7 +241,6 @@ class MyVpnService : VpnService() {
             return
         }
 
-        // إذا خرج المستخدم إلى الشاشة الرئيسية (Launcher)، أوقف تمرير بيانات التطبيقات فوراً
         if (launcherPackages.contains(fgPkg)) {
             if (forwarder.activeForegroundUid != Process.INVALID_UID) {
                 forwarder.activeForegroundUid = Process.INVALID_UID
@@ -294,7 +292,7 @@ class MyVpnService : VpnService() {
                 updateForegroundAppState()
                 killBackgroundProcesses(getBlockedNonForegroundPackages())
             } catch (_: Exception) {}
-        }, 2, 3, TimeUnit.SECONDS)
+        }, 3, 4, TimeUnit.SECONDS)
     }
 
     private fun stopBackgroundEnforcer() {
