@@ -8,6 +8,7 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -74,8 +75,6 @@ class MyVpnService : VpnService() {
         currentLimitKb = speedKb
         savedBgKillPackages = bgKillPackages
 
-        // الحل الثاني: قطع الإنترنت تماماً عن تطبيقات حظر الخلفية عبر حجبها أو إسقاط حزمها
-        // مع الحفاظ على عمل تطبيقات السرعة المحددة فقط داخل النفق المقيد
         val activeSpeedPackages = targetPackages.filter { !bgKillPackages.contains(it) && it != packageName }
 
         killBackgroundProcesses(bgKillPackages)
@@ -114,7 +113,6 @@ class MyVpnService : VpnService() {
         autoRefreshExecutor = null
     }
 
-    // مراقب دوري كل 10 ثوانٍ لإيقاف عمليات تطبيقات الخلفية المحظورة
     private fun startBackgroundEnforcer() {
         stopBackgroundEnforcer()
         if (savedBgKillPackages.isEmpty()) return
@@ -122,7 +120,7 @@ class MyVpnService : VpnService() {
         bgEnforcerExecutor?.scheduleWithFixedDelay({
             if (!isServiceRunning) return@scheduleWithFixedDelay
             killBackgroundProcesses(savedBgKillPackages)
-        }, 10, 10, TimeUnit.SECONDS)
+        }, 5, 5, TimeUnit.SECONDS)
     }
 
     private fun stopBackgroundEnforcer() {
@@ -197,6 +195,19 @@ class MyVpnService : VpnService() {
         } catch (_: Exception) {}
     }
 
+    private fun resolveBlockedUids(packages: List<String>): Set<Int> {
+        val uids = HashSet<Int>()
+        val pm = packageManager
+        for (pkg in packages) {
+            if (pkg == packageName) continue
+            try {
+                val appInfo = pm.getApplicationInfo(pkg, 0)
+                uids.add(appInfo.uid)
+            } catch (_: Exception) {}
+        }
+        return uids
+    }
+
     private fun acquireWakeLock() {
         try {
             if (wakeLock == null) {
@@ -229,7 +240,17 @@ class MyVpnService : VpnService() {
         val limiter = RateLimiter(speedKb.toLong() * 1024L)
         rateLimiter = limiter
         val maxSessionBytes = if (sessionLimitKb > 0) sessionLimitKb.toLong() * 1024L else Long.MAX_VALUE
-        packetForwarder = PacketForwarder(this, limiter, maxSessionBytes)
+
+        val blockedUids = resolveBlockedUids(blockedBgPackages)
+        val connManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+
+        packetForwarder = PacketForwarder(
+            vpnService = this,
+            rateLimiter = limiter,
+            maxSessionBytes = maxSessionBytes,
+            blockedUids = blockedUids,
+            connectivityManager = connManager
+        )
 
         val builder = Builder()
             .setSession("SpeedLimiter")
@@ -242,9 +263,6 @@ class MyVpnService : VpnService() {
             .setMtu(1400)
             .setBlocking(true)
 
-        // الحل الأول: الوضع الشامل (Default-Deny)
-        // تمرير جميع حزم الجهاز وخدمات الخلفية (بما فيها Google Play Services) عبر نفق SpeedLimiter
-        // واستثناء تطبيقنا نفسه وخدمات الاتصال الهاتفية الأساسية فقط لعدم الإضرار بالنظام
         val essentialSystemExceptions = setOf(
             packageName,
             "com.android.phone",
@@ -258,13 +276,6 @@ class MyVpnService : VpnService() {
                 builder.addDisallowedApplication(excludedPkg)
             } catch (_: Exception) {}
         }
-
-        // الحل الثاني: قطع الإنترنت تماماً عن تطبيقات "حظر الخلفية"
-        // استثناؤها من النفق الحقيقي وتوجيهها لنفق معزول (Blackhole) أو منعها من تمرير البيانات
-        // ملاحظة: في أندرويد، إذا أردنا تمرير كل شيء للنفق باستثناء تطبيقات معينة نستخدم addDisallowedApplication
-        // ولقطع الإنترنت تماماً عن تطبيقات حظر الخلفية دون إبطاء البقية، نضيفها هنا كاستثناء أو نمررها،
-        // ولكن لضمان عدم حصولها على إنترنت خارج النفق، نُبقيها داخل النفق ونوقف عملياتها دورياً
-        // بينما نمنع أي تسرب خارجي عبر شمولية النفق لجميع التطبيقات وخدمات جوجل!
 
         vpnInterface = builder.establish()
 
