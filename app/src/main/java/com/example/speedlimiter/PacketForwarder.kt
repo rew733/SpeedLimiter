@@ -30,27 +30,16 @@ class PacketForwarder(
     private val blockedUids: Set<Int> = emptySet()
 ) {
     companion object {
-        /** صلاحية الوصول لبيانات الاستخدام غير ممنوحة: لا يمكن معرفة تطبيق المقدمة، فلا يُحظر شيء */
         const val UID_UNKNOWN = -1
-
-        /** لا يوجد أي تطبيق في المقدمة (الشاشة مطفأة مثلاً): تُحظر كل التطبيقات المحظورة */
         const val UID_NONE = -2
 
-        /**
-         * أقصى عدد اتصالات TCP متزامنة لكل تطبيق (كان 2 لكل التطبيقات مجتمعة).
-         * أنزله إلى 2 إن أردت منع التحميل المسبق للفيديوهات بشكل أشد.
-         */
-        private const val MAX_CONNECTIONS_PER_APP = 8
-
-        /** عند تعذّر معرفة صاحب الاتصال (أندرويد أقدم من 10) تُشارك كل التطبيقات هذا الحد */
+        private const val MAX_CONNECTIONS_PER_APP = 12
         private const val MAX_CONNECTIONS_UNKNOWN_UID = 32
 
         private const val SLOT_WAIT_SECONDS = 10L
         private const val UID_CACHE_TTL_MS = 30_000L
 
         private const val SEQ_MASK = 0xFFFFFFFFL
-
-        /** أقصى حمولة لكل حزمة = MTU (1400) - 40 بايت ترويسة */
         private const val MAX_PAYLOAD = 1360
 
         private const val RTO_MIN_MS = 400L
@@ -61,14 +50,10 @@ class PacketForwarder(
     }
 
     private class CachedUid(val uid: Int, val time: Long)
-
-    /** مقطع بيانات أُرسل إلى التطبيق ولم يصله تأكيد (ACK) بعد */
     private class Segment(val seq: Long, val data: ByteArray)
 
     private val executor = Executors.newCachedThreadPool()
     private val tcpSessions = ConcurrentHashMap<String, TcpSession>()
-
-    // قنوات اتصال مستقلة لكل تطبيق: تطبيق واحد لا يستطيع تجويع بقية التطبيقات
     private val connectionSlots = ConcurrentHashMap<Int, Semaphore>()
     private val uidCache = ConcurrentHashMap<String, CachedUid>()
     private val retransmitTimer = Executors.newSingleThreadScheduledExecutor()
@@ -118,7 +103,6 @@ class PacketForwarder(
         executor.shutdownNow()
     }
 
-    /** يُستدعى من مراقب التطبيق الأمامي. عند تغيّر التطبيق تُقطع فوراً اتصالات التطبيقات المحظورة المفتوحة. */
     fun updateForegroundUid(uid: Int) {
         if (uid == currentForegroundUid) return
         currentForegroundUid = uid
@@ -127,16 +111,14 @@ class PacketForwarder(
         }
     }
 
-    /** هل يجب حظر هذا التطبيق الآن؟ (محظور + ليس في المقدمة) */
     private fun isBlocked(uid: Int): Boolean {
-        if (uid < 0) return false                 // صاحب الاتصال مجهول: لا نحظر (fail-open)
+        if (uid < 0) return false
         if (uid !in blockedUids) return false
         val fg = currentForegroundUid
-        if (fg == UID_UNKNOWN) return false       // لا نعرف تطبيق المقدمة: لا نحظر
+        if (fg == UID_UNKNOWN) return false
         return uid != fg
     }
 
-    /** يحدد UID صاحب الاتصال (أندرويد 10+). يُرجع UID_UNKNOWN إن تعذّر. */
     private fun lookupUid(protocol: Int, srcIp: ByteArray, srcPort: Int, dstIp: ByteArray, dstPort: Int): Int {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return UID_UNKNOWN
         val cm = connectivityManager ?: return UID_UNKNOWN
@@ -175,9 +157,13 @@ class PacketForwarder(
     private fun seqLt(a: Long, b: Long): Boolean = a != b && seqDiff(a, b) > 0x7FFFFFFFL
     private fun seqLe(a: Long, b: Long): Boolean = a == b || seqLt(a, b)
 
-    /** نافذة الاستقبال المطلوبة من الخادم: نحو 0.3 ثانية من السرعة المحددة (بين 16KB و256KB) */
+    private fun effectiveSpeedBytesPerSec(): Long {
+        val base = rateLimiter.bytesPerSecond.coerceAtLeast(1024L)
+        return if (rateLimiter.isBoostActive) base * 4L else base
+    }
+
     private fun receiveWindowBytes(): Int =
-        (rateLimiter.bytesPerSecond * 3 / 10).coerceIn(16L * 1024, 256L * 1024).toInt()
+        (effectiveSpeedBytesPerSec() * 4 / 10).coerceIn(32L * 1024, 256L * 1024).toInt()
 
     private fun writePacket(outputStream: FileOutputStream, pkt: ByteArray) {
         synchronized(outputStream) {
@@ -209,10 +195,6 @@ class PacketForwarder(
         }
     }
 
-    /**
-     * IPv6 غير مُمرَّر عبر هذا المُرسِل. بدل إسقاط الحزم بصمت (فيعلق التطبيق حتى انتهاء المهلة)
-     * نردّ بـ ICMPv6 "unreachable" فيتراجع التطبيق إلى IPv4 فوراً.
-     */
     private fun handleIpv6Packet(rawPacket: ByteArray, outputStream: FileOutputStream) {
         if (rawPacket.size < 40) return
         val nextHeader = rawPacket[6].toInt() and 0xFF
@@ -231,7 +213,6 @@ class PacketForwarder(
         val srcPort = ((rawPacket[ipHeaderLen].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 1].toInt() and 0xFF)
         val dstPort = ((rawPacket[ipHeaderLen + 2].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 3].toInt() and 0xFF)
 
-        // QUIC (UDP/443): نردّ بـ ICMP unreachable ليعود التطبيق إلى TCP فوراً
         if (dstPort == 443) {
             writePacket(outputStream, buildIcmpPortUnreachable(rawPacket, ipHeaderLen))
             return
@@ -263,7 +244,6 @@ class PacketForwarder(
                 val respPacket = DatagramPacket(respBuf, respBuf.size)
                 socket.receive(respPacket)
 
-                // إن أصبح التطبيق محظوراً أثناء الانتظار فلا نُسلّمه الرد
                 if (isBlocked(uid)) return@execute
 
                 val respData = respPacket.data.copyOf(respPacket.length)
@@ -314,7 +294,6 @@ class PacketForwarder(
         if (syn && !ack) {
             val existing = tcpSessions[sessionKey]
             if (existing != null && existing.clientIsn == seqNum) {
-                // إعادة إرسال SYN نفسه: لا ننشئ جلسة جديدة (كانت تسبب جلسات "زومبي" تستنزف القنوات)
                 existing.resendSynAckIfConnected()
                 return
             }
@@ -325,7 +304,6 @@ class PacketForwarder(
 
             val uid = lookupUid(OsConstants.IPPROTO_TCP, srcIp, srcPort, dstIp, dstPort)
             if (isBlocked(uid)) {
-                // RST فوري ليفشل الاتصال بسرعة بدل أن يعيد التطبيق المحاولة
                 val rstPkt = buildTcpIpPacket(
                     dstIp, dstPort, srcIp, srcPort,
                     0L, (seqNum + 1) and 0xFFFFFFFFL, 0x14, ByteArray(0)
@@ -388,32 +366,27 @@ class PacketForwarder(
         @Volatile private var closed = false
         @Volatile private var handshakeDone = false
 
-        // التحكم بالتدفق وإعادة الإرسال نحو التطبيق (كل ما يلي محمي بـ flowLock)
         private val flowLock = ReentrantLock()
         private val flowChanged = flowLock.newCondition()
         private val unacked = ArrayDeque<Segment>()
         private var sndUna: Long = (initialSeq + 1) and SEQ_MASK
-        private var clientWindow: Int = 16384
+        private var clientWindow: Int = 65535
         private var dupAcks = 0
         private var retries = 0
         private var lastProgress = 0L
 
         fun connect() {
             try {
-                // انتظار قناة متاحة لهذا التطبيق (مهلة محددة بدل الانتظار للأبد)
                 if (!slot.tryAcquire(SLOT_WAIT_SECONDS, TimeUnit.SECONDS)) {
                     if (!closed) sendRst()
                     return
                 }
                 slotHeld.set(true)
 
-                // أُغلقت الجلسة (إعادة SYN / حظر / إيقاف) أثناء الانتظار: لا نتصل
                 if (closed || !running) return
 
                 vpnService.protect(socket)
                 socket.tcpNoDelay = true
-                // نافذة استقبال متناسبة مع السرعة المحددة: التقييد الفعلي يتم بالـ RateLimiter،
-                // أما نافذة 1KB السابقة فكانت تحصر كل اتصال بعشرات الكيلوبايت مهما رُفع الحد
                 socket.receiveBufferSize = receiveWindowBytes()
                 socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 8000)
                 if (closed) return
@@ -433,7 +406,6 @@ class PacketForwarder(
                 while (running && connected && !socket.isClosed) {
                     val read = inStream.read(buffer)
                     if (read == -1) {
-                        // نتأكد أن التطبيق استلم كل البيانات قبل إرسال FIN
                         waitForDrain(DRAIN_WAIT_MS)
                         val finSeq = flowLock.withLock {
                             val s = mySeq
@@ -453,7 +425,6 @@ class PacketForwarder(
                             sendRst()
                             break
                         }
-                        // لا نرسل أكثر مما تسمح به نافذة التطبيق (كان يُرسل دون مراعاة النافذة فتضيع البيانات)
                         if (!waitForWindow(read)) break
                         rateLimiter.acquire(read)
                         totalDownloadedBytes += read
@@ -462,11 +433,9 @@ class PacketForwarder(
                     }
                 }
             } catch (_: Exception) {
-                // فشل الاتصال بالخادم: نُبلغ التطبيق فوراً بدل تركه ينتظر المهلة
                 if (!handshakeDone && !closed) sendRst()
             } finally {
                 close()
-                // نحذف جلستنا فقط، وليس جلسة جديدة بالمفتاح نفسه
                 tcpSessions.remove(key, this)
             }
         }
@@ -487,7 +456,6 @@ class PacketForwarder(
             writeToTun(pkt)
         }
 
-        /** ينتظر حتى تتسع نافذة التطبيق للبيانات الجديدة. يعيد false إذا أُغلقت الجلسة. */
         private fun waitForWindow(len: Int): Boolean {
             flowLock.withLock {
                 while (!closed && running) {
@@ -508,12 +476,12 @@ class PacketForwarder(
             }
         }
 
-        /** يُستدعى لكل حزمة ACK قادمة من التطبيق: يحدّث النافذة ويحذف المقاطع المؤكَّدة */
         fun onClientAck(ack: Long, window: Int, pureAck: Boolean) {
             if (!connected) return
             var fastRetransmit: Segment? = null
             flowLock.withLock {
-                clientWindow = window
+                val scaledWin = if (window > 0) (window shl 4).coerceAtMost(262144) else 0
+                clientWindow = maxOf(window, scaledWin)
                 if (seqLt(sndUna, ack) && seqLe(ack, mySeq)) {
                     sndUna = ack
                     while (true) {
@@ -533,7 +501,6 @@ class PacketForwarder(
             fastRetransmit?.let { writeSegment(it) }
         }
 
-        /** يُستدعى دورياً: يعيد إرسال المقاطع التي لم تُؤكَّد، ويقطع الجلسة إن انقطع التطبيق تماماً */
         fun checkRetransmit() {
             if (closed || !connected) return
             var toResend: List<Segment> = emptyList()
@@ -601,7 +568,6 @@ class PacketForwarder(
             close()
         }
 
-        /** قطع الجلسة فوراً مع إرسال RST للتطبيق (يُستدعى عند الحظر) */
         fun reset() {
             sendRst()
             close()
@@ -695,7 +661,7 @@ class PacketForwarder(
         buf.putInt(ack.toInt())
         buf.put(0x50.toByte())
         buf.put(flags.toByte())
-        buf.putShort(1024.toShort())
+        buf.putShort(32768.toShort())
         buf.putShort(0)
         buf.putShort(0)
         buf.put(payload)
@@ -706,7 +672,6 @@ class PacketForwarder(
         return buf.array()
     }
 
-    /** ICMP "destination unreachable / port unreachable" ردّاً على حزمة IPv4 صادرة */
     private fun buildIcmpPortUnreachable(orig: ByteArray, ipHeaderLen: Int): ByteArray {
         val embedded = minOf(orig.size, ipHeaderLen + 8)
         val icmpLen = 8 + embedded
@@ -719,40 +684,39 @@ class PacketForwarder(
         buf.putShort(0)
         buf.putShort(0x4000.toShort())
         buf.put(64.toByte())
-        buf.put(1.toByte())            // ICMP
+        buf.put(1.toByte())
         buf.putShort(0)
-        buf.put(orig, 16, 4)           // المصدر = وجهة الحزمة الأصلية
-        buf.put(orig, 12, 4)           // الوجهة = مصدر الحزمة الأصلية
+        buf.put(orig, 16, 4)
+        buf.put(orig, 12, 4)
 
         buf.putShort(10, computeChecksum(buf.array(), 0, 20))
 
-        buf.put(3.toByte())            // type: destination unreachable
-        buf.put(3.toByte())            // code: port unreachable
-        buf.putShort(0)                // checksum (placeholder)
-        buf.putInt(0)                  // unused
+        buf.put(3.toByte())
+        buf.put(3.toByte())
+        buf.putShort(0)
+        buf.putInt(0)
         buf.put(orig, 0, embedded)
 
         buf.putShort(22, computeChecksum(buf.array(), 20, icmpLen))
         return buf.array()
     }
 
-    /** ICMPv6 "destination unreachable / port unreachable" ردّاً على حزمة IPv6 صادرة */
     private fun buildIcmp6Unreachable(orig: ByteArray): ByteArray {
         val embedded = minOf(orig.size, 200)
         val icmpLen = 8 + embedded
         val buf = ByteBuffer.allocate(40 + icmpLen)
 
-        buf.putInt(0x60000000)             // version 6, traffic class 0, flow label 0
-        buf.putShort(icmpLen.toShort())    // payload length
-        buf.put(58.toByte())               // next header: ICMPv6
-        buf.put(64.toByte())               // hop limit
-        buf.put(orig, 24, 16)              // المصدر = وجهة الحزمة الأصلية
-        buf.put(orig, 8, 16)               // الوجهة = مصدر الحزمة الأصلية
+        buf.putInt(0x60000000)
+        buf.putShort(icmpLen.toShort())
+        buf.put(58.toByte())
+        buf.put(64.toByte())
+        buf.put(orig, 24, 16)
+        buf.put(orig, 8, 16)
 
-        buf.put(1.toByte())                // type: destination unreachable
-        buf.put(4.toByte())                // code: port unreachable
-        buf.putShort(0)                    // checksum (placeholder)
-        buf.putInt(0)                      // unused
+        buf.put(1.toByte())
+        buf.put(4.toByte())
+        buf.putShort(0)
+        buf.putInt(0)
         buf.put(orig, 0, embedded)
 
         buf.putShort(42, computeIcmp6Checksum(buf.array(), 40, icmpLen))
@@ -761,7 +725,6 @@ class PacketForwarder(
 
     private fun computeIcmp6Checksum(packet: ByteArray, icmpOffset: Int, icmpLen: Int): Short {
         var sum = 0L
-        // pseudo-header: عنوان المصدر (8..23) ثم الوجهة (24..39)
         var i = 8
         while (i < 40) {
             sum += ((packet[i].toInt() and 0xFF) shl 8) or (packet[i + 1].toInt() and 0xFF)

@@ -37,11 +37,9 @@ class MyVpnService : VpnService() {
     private var lastBytesSnapshot: Long = 0L
     private var boostEndTimeMillis: Long = 0L
 
-    // آخر تطبيق في المقدمة (null = لا يوجد تطبيق في المقدمة)
     private var lastKnownForegroundPkg: String? = null
     private var lastEventQueryTime: Long = 0L
 
-    // false = صلاحية "الوصول إلى بيانات الاستخدام" غير ممنوحة، فلا يعمل حظر الخلفية
     @Volatile private var usageAccessGranted: Boolean = true
 
     companion object {
@@ -84,10 +82,8 @@ class MyVpnService : VpnService() {
 
         cleanupTunnel()
         acquireWakeLock()
-        // يجب استدعاء startForeground بسرعة بعد startForegroundService
         startForegroundNotification(buildNotification(0.0, 0.0, 0))
 
-        // قائمتان فارغتان تعني أن النفق سيلتقط كل تطبيقات الهاتف: نمنع ذلك
         val tunnelPackages = (targetPackages + bgKillPackages).filter { it != packageName }.toSet()
         if (tunnelPackages.isEmpty()) {
             stopVpn()
@@ -109,6 +105,10 @@ class MyVpnService : VpnService() {
         if (!isServiceRunning) return
         boostEndTimeMillis = System.currentTimeMillis() + 30_000L
         rateLimiter?.setBoost(true)
+        val totalBytes = packetForwarder?.totalBytesTransferred?.get() ?: 0L
+        val totalUsedMb = totalBytes / (1024.0 * 1024.0)
+        val manager = getSystemService(NotificationManager::class.java)
+        manager?.notify(1, buildNotification(0.0, totalUsedMb, 30))
     }
 
     private fun stopBoost() {
@@ -171,7 +171,6 @@ class MyVpnService : VpnService() {
             try {
                 if (!hasUsageAccess()) {
                     usageAccessGranted = false
-                    // لا يمكن معرفة تطبيق المقدمة: لا نحظر شيئاً بدل أن نقطع الإنترنت عن الجميع
                     packetForwarder?.updateForegroundUid(PacketForwarder.UID_UNKNOWN)
                     return@scheduleWithFixedDelay
                 }
@@ -180,7 +179,6 @@ class MyVpnService : VpnService() {
                 val fgPkg = readForegroundPackage()
                 lastKnownForegroundPkg = fgPkg
 
-                // لا تطبيق في المقدمة (أو تطبيق لا نراه): كل التطبيقات المحظورة تُعتبر في الخلفية
                 val uid = if (fgPkg == null) {
                     PacketForwarder.UID_NONE
                 } else {
@@ -195,10 +193,6 @@ class MyVpnService : VpnService() {
         }, 0, 500, TimeUnit.MILLISECONDS)
     }
 
-    /**
-     * يعيد اسم حزمة التطبيق الذي في المقدمة، أو null إن لم يكن هناك واحد
-     * (مثلاً بعد إطفاء الشاشة: يصل حدث ACTIVITY_PAUSED دون ACTIVITY_RESUMED بعده).
-     */
     private fun readForegroundPackage(): String? {
         val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
         val now = System.currentTimeMillis()
@@ -284,7 +278,6 @@ class MyVpnService : VpnService() {
         } catch (_: Exception) {}
     }
 
-    /** يعيد false إذا تعذّر إنشاء النفق (وفي هذه الحالة تكون الخدمة قد أُوقفت). */
     private fun startVpn(
         targetPackages: List<String>,
         bgKillPackages: List<String>,
@@ -330,7 +323,6 @@ class MyVpnService : VpnService() {
             } catch (_: Exception) {}
         }
 
-        // إن فشلت إضافة كل التطبيقات فلا نُنشئ النفق: وإلا سيلتقط كل تطبيقات الهاتف ويقطع الإنترنت عنها
         if (addedApps == 0) {
             stopVpn()
             return false
