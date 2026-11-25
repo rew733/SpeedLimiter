@@ -1,8 +1,12 @@
 package com.example.speedlimiter
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.VpnService
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -11,7 +15,6 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -22,6 +25,8 @@ class MyVpnService : VpnService() {
         const val ACTION_STOP = "com.example.speedlimiter.ACTION_STOP"
         const val EXTRA_SPEED_KBPS = "speed_kbps"
         const val EXTRA_SELECTED_PACKAGES = "selected_packages"
+        private const val CHANNEL_ID = "speed_limiter_vpn_channel"
+        private const val NOTIFICATION_ID = 101
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
@@ -35,19 +40,63 @@ class MyVpnService : VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            stopVpnNow()
+            isRunning = false
+            closeAllResources()
+            stopForegroundCompat()
+            stopSelf()
             return START_NOT_STICKY
         }
 
         val speedKbps = intent?.getLongExtra(EXTRA_SPEED_KBPS, 150L) ?: 150L
-        rateLimiter.setSpeedLimitKbps(speedKbps)
-
         val selectedPackages = intent?.getStringArrayListExtra(EXTRA_SELECTED_PACKAGES) ?: arrayListOf()
 
-        stopVpnNow()
+        // تنظيف الجلسة السابقة فقط دون استدعاء stopSelf()
+        isRunning = false
+        closeAllResources()
+
+        rateLimiter.setSpeedLimitKbps(speedKbps)
+        startForegroundNotification(speedKbps, selectedPackages.size)
+
         isRunning = true
         startVpn(selectedPackages)
         return START_STICKY
+    }
+
+    private fun startForegroundNotification(speedKbps: Long, appsCount: Int) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "SpeedLimiter VPN",
+                NotificationManager.IMPORTANCE_LOW
+            )
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.createNotificationChannel(channel)
+        }
+
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }
+
+        val notification = builder
+            .setContentTitle("SpeedLimiter VPN نشط")
+            .setContentText("الحد: $speedKbps KB/s | التطبيقات: $appsCount")
+            .setSmallIcon(android.R.drawable.ic_lock_lock)
+            .setOngoing(true)
+            .build()
+
+        startForeground(NOTIFICATION_ID, notification)
+    }
+
+    private fun stopForegroundCompat() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
     }
 
     private fun startVpn(selectedPackages: List<String>) {
@@ -75,8 +124,10 @@ class MyVpnService : VpnService() {
             }
         }
 
-        val established = builder.establish() ?: run {
+        val established = builder.establish()
+        if (established == null) {
             isRunning = false
+            stopForegroundCompat()
             stopSelf()
             return
         }
@@ -84,7 +135,6 @@ class MyVpnService : VpnService() {
 
         val pool = Executors.newCachedThreadPool()
         executorService = pool
-
         pool.execute {
             runPacketLoop(established)
         }
@@ -109,8 +159,6 @@ class MyVpnService : VpnService() {
                 handleIpv4Packet(buffer, length, output)
             }
         } catch (_: Exception) {
-        } finally {
-            closeAllResources()
         }
     }
 
@@ -237,10 +285,7 @@ class MyVpnService : VpnService() {
 
         if (rst || fin) {
             tcpSockets.remove(key)?.let {
-                try {
-                    it.close()
-                } catch (_: Exception) {
-                }
+                try { it.close() } catch (_: Exception) {}
             }
             return
         }
@@ -261,7 +306,7 @@ class MyVpnService : VpnService() {
                         dstPort = srcPort,
                         seq = 1000L,
                         ack = (seqNum + 1L) and 0xFFFFFFFFL,
-                        flags = 0x12 // SYN + ACK
+                        flags = 0x12
                     )
                     synchronized(tunOut) {
                         if (isRunning) tunOut.write(synAck)
@@ -293,10 +338,7 @@ class MyVpnService : VpnService() {
                 } catch (_: Exception) {
                 } finally {
                     tcpSockets.remove(key)?.let {
-                        try {
-                            it.close()
-                        } catch (_: Exception) {
-                        }
+                        try { it.close() } catch (_: Exception) {}
                     }
                 }
             }
@@ -330,7 +372,6 @@ class MyVpnService : VpnService() {
         val out = ByteArray(totalLen)
 
         out[0] = 0x45.toByte()
-        out[1] = 0x00
         out[2] = ((totalLen ushr 8) and 0xFF).toByte()
         out[3] = (totalLen and 0xFF).toByte()
         out[6] = 0x40.toByte()
@@ -414,7 +455,7 @@ class MyVpnService : VpnService() {
         writeUint32(out, 24, seq)
         writeUint32(out, 28, ack)
         out[32] = 0x50.toByte()
-        out[33] = 0x18.toByte() // PSH + ACK
+        out[33] = 0x18.toByte()
         out[34] = 0xFF.toByte()
         out[35] = 0xFF.toByte()
 
@@ -458,32 +499,17 @@ class MyVpnService : VpnService() {
         return "${ip[0].toInt() and 0xFF}.${ip[1].toInt() and 0xFF}.${ip[2].toInt() and 0xFF}.${ip[3].toInt() and 0xFF}"
     }
 
-    private fun stopVpnNow() {
-        isRunning = false
-        closeAllResources()
-        stopSelf()
-    }
-
     private fun closeAllResources() {
-        try {
-            vpnInterface?.close()
-        } catch (_: Exception) {
-        }
+        try { vpnInterface?.close() } catch (_: Exception) {}
         vpnInterface = null
 
         tcpSockets.values.forEach {
-            try {
-                it.close()
-            } catch (_: Exception) {
-            }
+            try { it.close() } catch (_: Exception) {}
         }
         tcpSockets.clear()
 
         udpSockets.values.forEach {
-            try {
-                it.close()
-            } catch (_: Exception) {
-            }
+            try { it.close() } catch (_: Exception) {}
         }
         udpSockets.clear()
 
@@ -498,7 +524,10 @@ class MyVpnService : VpnService() {
     }
 
     override fun onRevoke() {
-        stopVpnNow()
+        isRunning = false
+        closeAllResources()
+        stopForegroundCompat()
+        stopSelf()
         super.onRevoke()
     }
 }
