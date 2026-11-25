@@ -5,13 +5,19 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.app.usage.UsageEvents
+import android.app.usage.UsageStatsManager
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
+import android.os.Process
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.Locale
@@ -29,11 +35,14 @@ class MyVpnService : VpnService() {
     private var monitorExecutor: ScheduledExecutorService? = null
     private var autoRefreshExecutor: ScheduledExecutorService? = null
     private var bgEnforcerExecutor: ScheduledExecutorService? = null
+    private var screenReceiver: BroadcastReceiver? = null
 
     private var currentLimitKb: Int = 70
     private var lastBytesSnapshot: Long = 0L
     private var boostEndTimeMillis: Long = 0L
+    private var savedAllowedPackages: List<String> = emptyList()
     private var savedBgKillPackages: List<String> = emptyList()
+    private var lastDetectedForegroundPkg: String? = null
 
     companion object {
         @Volatile
@@ -73,23 +82,16 @@ class MyVpnService : VpnService() {
 
         currentLimitKb = speedKb
         savedBgKillPackages = bgKillPackages
+        // التطبيقات المسموح لها بالعمل (فقط عندما تكون في الواجهة المباشرة)
+        savedAllowedPackages = targetPackages.filter { !bgKillPackages.contains(it) && it != packageName }
 
-        // ضم التطبيقات المحددة + تطبيقات حظر الخلفية + خدمات نقل البيانات الخلفية داخل النفق المقيد
-        val tunnelPackages = LinkedHashSet<String>().apply {
-            addAll(targetPackages)
-            addAll(bgKillPackages)
-            add("com.google.android.gms")
-            add("com.android.vending")
-            add("com.android.providers.downloads")
-            remove(packageName)
-        }.toList()
-
-        killBackgroundProcesses(bgKillPackages)
+        killBackgroundProcesses(getAllNonForegroundManagedPackages())
 
         cleanupTunnel()
         acquireWakeLock()
+        registerScreenStateReceiver()
         startForegroundNotification(buildNotification(0.0, 0.0, 0))
-        startVpn(tunnelPackages, speedKb, sessionLimitKb)
+        startVpn(savedAllowedPackages, savedBgKillPackages, speedKb, sessionLimitKb)
         startLiveMonitor()
         startAutoRefreshTimer()
         startBackgroundEnforcer()
@@ -97,11 +99,140 @@ class MyVpnService : VpnService() {
         return START_REDELIVER_INTENT
     }
 
+    private fun registerScreenStateReceiver() {
+        unregisterScreenStateReceiver()
+        screenReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                when (intent?.action) {
+                    Intent.ACTION_SCREEN_OFF -> {
+                        packetForwarder?.isScreenOn = false
+                        packetForwarder?.activeForegroundUid = Process.INVALID_UID
+                        packetForwarder?.closeAllSessionsImmediately()
+                        killBackgroundProcesses(getAllManagedPackages())
+                    }
+                    Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
+                        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                        packetForwarder?.isScreenOn = pm?.isInteractive ?: true
+                        updateForegroundAppState()
+                    }
+                }
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(screenReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(screenReceiver, filter)
+        }
+    }
+
+    private fun unregisterScreenStateReceiver() {
+        try {
+            if (screenReceiver != null) {
+                unregisterReceiver(screenReceiver)
+            }
+        } catch (_: Exception) {}
+        screenReceiver = null
+    }
+
+    private fun getAllManagedPackages(): List<String> {
+        return LinkedHashSet<String>().apply {
+            addAll(savedAllowedPackages)
+            addAll(savedBgKillPackages)
+            remove(packageName)
+        }.toList()
+    }
+
+    private fun getAllNonForegroundManagedPackages(): List<String> {
+        val fgPkg = detectForegroundPackageName()
+        return getAllManagedPackages().filter { it != fgPkg }
+    }
+
+    /**
+     * تحديد التطبيق الذي يستخدمه المستخدم مباشرة الآن في الواجهة.
+     * بمجرد الخروج من التطبيق يصبح في حكم تطبيقات الخلفية وتُقطع عنه البيانات فوراً.
+     */
+    private fun detectForegroundPackageName(): String? {
+        try {
+            val usm = getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
+            if (usm != null) {
+                val now = System.currentTimeMillis()
+                val events = usm.queryEvents(now - 15_000L, now)
+                val event = UsageEvents.Event()
+                var latestPkg: String? = null
+                var latestTime = 0L
+                while (events.hasNextEvent()) {
+                    events.getNextEvent(event)
+                    if (event.eventType == UsageEvents.Event.ACTIVITY_RESUMED && event.timeStamp >= latestTime) {
+                        latestTime = event.timeStamp
+                        latestPkg = event.packageName
+                    }
+                }
+                if (latestPkg != null) {
+                    lastDetectedForegroundPkg = latestPkg
+                    return latestPkg
+                }
+            }
+        } catch (_: Exception) {}
+
+        try {
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            val runningApps = am?.runningAppProcesses
+            if (runningApps != null) {
+                for (proc in runningApps) {
+                    if (proc.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND) {
+                        val pkg = proc.pkgList?.firstOrNull()
+                        if (pkg != null) {
+                            lastDetectedForegroundPkg = pkg
+                            return pkg
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        return lastDetectedForegroundPkg
+    }
+
+    private fun updateForegroundAppState() {
+        val forwarder = packetForwarder ?: return
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+        val screenInteractive = pm?.isInteractive ?: true
+        forwarder.isScreenOn = screenInteractive
+
+        if (!screenInteractive) {
+            forwarder.activeForegroundUid = Process.INVALID_UID
+            return
+        }
+
+        val fgPkg = detectForegroundPackageName()
+        if (fgPkg == null || fgPkg == packageName) {
+            forwarder.activeForegroundUid = Process.INVALID_UID
+            return
+        }
+
+        try {
+            val appInfo = packageManager.getApplicationInfo(fgPkg, 0)
+            val prevUid = forwarder.activeForegroundUid
+            forwarder.activeForegroundUid = appInfo.uid
+            if (prevUid != Process.INVALID_UID && prevUid != appInfo.uid) {
+                forwarder.refreshSessions()
+            }
+        } catch (_: Exception) {
+            forwarder.activeForegroundUid = Process.INVALID_UID
+        }
+    }
+
     private fun performInternalRefresh() {
         if (!isServiceRunning) return
         try {
+            updateForegroundAppState()
             packetForwarder?.refreshSessions()
-            killBackgroundProcesses(savedBgKillPackages)
+            killBackgroundProcesses(getAllNonForegroundManagedPackages())
             System.gc()
             refreshNotificationNow()
         } catch (_: Exception) {}
@@ -120,14 +251,17 @@ class MyVpnService : VpnService() {
         autoRefreshExecutor = null
     }
 
+    // فحص التطبيق النشط في المقدمة كل 1.5 ثانية وإغلاق أي تطبيق خرج منه المستخدم فوراً
     private fun startBackgroundEnforcer() {
         stopBackgroundEnforcer()
-        if (savedBgKillPackages.isEmpty()) return
         bgEnforcerExecutor = Executors.newSingleThreadScheduledExecutor()
         bgEnforcerExecutor?.scheduleWithFixedDelay({
             if (!isServiceRunning) return@scheduleWithFixedDelay
-            killBackgroundProcesses(savedBgKillPackages)
-        }, 5, 5, TimeUnit.SECONDS)
+            try {
+                updateForegroundAppState()
+                killBackgroundProcesses(getAllNonForegroundManagedPackages())
+            } catch (_: Exception) {}
+        }, 1, 2, TimeUnit.SECONDS)
     }
 
     private fun stopBackgroundEnforcer() {
@@ -202,6 +336,21 @@ class MyVpnService : VpnService() {
         } catch (_: Exception) {}
     }
 
+    private fun resolveUserAppUids(packages: List<String>): Set<Int> {
+        val uids = HashSet<Int>()
+        val pm = packageManager
+        for (pkg in packages) {
+            if (pkg == packageName) continue
+            try {
+                val appInfo = pm.getApplicationInfo(pkg, 0)
+                if (appInfo.uid >= Process.FIRST_APPLICATION_UID) {
+                    uids.add(appInfo.uid)
+                }
+            } catch (_: Exception) {}
+        }
+        return uids
+    }
+
     private fun acquireWakeLock() {
         try {
             if (wakeLock == null) {
@@ -221,7 +370,12 @@ class MyVpnService : VpnService() {
         } catch (_: Exception) {}
     }
 
-    private fun startVpn(targetPackages: List<String>, speedKb: Int, sessionLimitKb: Int) {
+    private fun startVpn(
+        allowedSpeedPackages: List<String>,
+        blockedBgPackages: List<String>,
+        speedKb: Int,
+        sessionLimitKb: Int
+    ) {
         isServiceRunning = true
         getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE).edit()
             .putBoolean("is_running", true).apply()
@@ -229,20 +383,46 @@ class MyVpnService : VpnService() {
         val limiter = RateLimiter(speedKb.toLong() * 1024L)
         rateLimiter = limiter
         val maxSessionBytes = if (sessionLimitKb > 0) sessionLimitKb.toLong() * 1024L else Long.MAX_VALUE
-        packetForwarder = PacketForwarder(this, limiter, maxSessionBytes)
+
+        val allowedUids = resolveUserAppUids(allowedSpeedPackages)
+        val blockedUids = resolveUserAppUids(blockedBgPackages)
+        val connManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+
+        packetForwarder = PacketForwarder(
+            vpnService = this,
+            rateLimiter = limiter,
+            maxSessionBytes = maxSessionBytes,
+            allowedUids = allowedUids,
+            blockedUids = blockedUids,
+            connectivityManager = connManager
+        )
+
+        updateForegroundAppState()
 
         val builder = Builder()
             .setSession("SpeedLimiter")
             .addAddress("10.0.0.2", 32)
             .addRoute("0.0.0.0", 0)
+            .addAddress("fd00:1::2", 64)
+            .addRoute("::", 0)
             .addDnsServer("8.8.8.8")
             .addDnsServer("1.1.1.1")
+            .addDnsServer("2001:4860:4860::8888")
             .setMtu(1400)
             .setBlocking(true)
 
-        for (pkg in targetPackages) {
-            if (pkg == packageName) continue
-            try { builder.addAllowedApplication(pkg) } catch (_: Exception) {}
+        val essentialSystemExceptions = setOf(
+            packageName,
+            "com.android.phone",
+            "com.android.mms",
+            "com.android.server.telecom",
+            "com.android.providers.telephony"
+        )
+
+        for (excludedPkg in essentialSystemExceptions) {
+            try {
+                builder.addDisallowedApplication(excludedPkg)
+            } catch (_: Exception) {}
         }
 
         vpnInterface = builder.establish()
@@ -261,6 +441,7 @@ class MyVpnService : VpnService() {
     }
 
     private fun cleanupTunnel() {
+        unregisterScreenStateReceiver()
         stopBackgroundEnforcer()
         stopAutoRefreshTimer()
         stopLiveMonitor()
