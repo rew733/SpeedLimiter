@@ -4,23 +4,18 @@ import android.net.ConnectivityManager
 import android.net.VpnService
 import android.os.Build
 import android.system.OsConstants
-import java.io.FileInputStream
-import java.io.FileOutputStream
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.ServerSocket
 import java.net.Socket
 import java.nio.ByteBuffer
-import java.util.ArrayDeque
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
-import java.util.concurrent.Semaphore
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
 
 class PacketForwarder(
     private val vpnService: VpnService,
@@ -32,35 +27,20 @@ class PacketForwarder(
     companion object {
         const val UID_UNKNOWN = -1
         const val UID_NONE = -2
-
-        private const val MAX_CONNECTIONS_PER_APP = 12
-        private const val MAX_CONNECTIONS_UNKNOWN_UID = 32
-
-        private const val SLOT_WAIT_SECONDS = 10L
-        private const val UID_CACHE_TTL_MS = 30_000L
-
-        private const val SEQ_MASK = 0xFFFFFFFFL
-        private const val MAX_PAYLOAD = 1360
-
-        private const val RTO_MIN_MS = 400L
-        private const val RTO_MAX_MS = 3000L
-        private const val MAX_RETRIES = 12
-        private const val RETRANS_BURST = 4
-        private const val DRAIN_WAIT_MS = 5000L
+        private const val IO_BUFFER_SIZE = 16384
     }
 
-    private class CachedUid(val uid: Int, val time: Long)
-    private class Segment(val seq: Long, val data: ByteArray)
-
     private val executor = Executors.newCachedThreadPool()
-    private val tcpSessions = ConcurrentHashMap<String, TcpSession>()
-    private val connectionSlots = ConcurrentHashMap<Int, Semaphore>()
-    private val uidCache = ConcurrentHashMap<String, CachedUid>()
-    private val retransmitTimer = Executors.newSingleThreadScheduledExecutor()
+    private val activeSockets = ConcurrentHashMap<Socket, Int>()
     private val connectivityManager: ConnectivityManager? =
         vpnService.getSystemService(ConnectivityManager::class.java)
 
     @Volatile private var running = false
+    private var serverSocket: ServerSocket? = null
+
+    @Volatile
+    var listenPort: Int = 0
+        private set
 
     @Volatile
     var currentForegroundUid: Int = UID_UNKNOWN
@@ -68,46 +48,47 @@ class PacketForwarder(
 
     val totalBytesTransferred = AtomicLong(0L)
 
-    fun start(inputStream: FileInputStream, outputStream: FileOutputStream) {
+    fun startServer(): Int {
+        if (running && listenPort > 0) return listenPort
+        val srv = ServerSocket()
+        srv.reuseAddress = true
+        srv.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0), 128)
+        serverSocket = srv
+        listenPort = srv.localPort
         running = true
-        retransmitTimer.scheduleWithFixedDelay({
-            for (session in tcpSessions.values) {
-                try { session.checkRetransmit() } catch (_: Exception) {}
-            }
-        }, 100, 100, TimeUnit.MILLISECONDS)
-        val packet = ByteBuffer.allocate(32767)
 
-        while (running && !Thread.currentThread().isInterrupted) {
-            try {
-                val length = inputStream.read(packet.array())
-                if (length > 0) {
-                    val data = packet.array().copyOf(length)
-                    handleOutgoingPacket(data, outputStream)
-                    packet.clear()
-                } else {
-                    Thread.sleep(2)
+        executor.execute {
+            while (running && !srv.isClosed) {
+                try {
+                    val client = srv.accept()
+                    client.tcpNoDelay = true
+                    executor.execute { handleSocksClient(client) }
+                } catch (_: Exception) {
+                    if (!running) break
                 }
-            } catch (_: InterruptedException) {
-                break
-            } catch (_: Exception) {
-                Thread.sleep(5)
             }
         }
+        return listenPort
     }
 
     fun stop() {
         running = false
-        tcpSessions.values.forEach { it.close() }
-        tcpSessions.clear()
-        retransmitTimer.shutdownNow()
-        executor.shutdownNow()
+        try { serverSocket?.close() } catch (_: Exception) {}
+        serverSocket = null
+        for (sock in activeSockets.keys) {
+            try { sock.close() } catch (_: Exception) {}
+        }
+        activeSockets.clear()
+        try { executor.shutdownNow() } catch (_: Exception) {}
     }
 
     fun updateForegroundUid(uid: Int) {
         if (uid == currentForegroundUid) return
         currentForegroundUid = uid
-        for (session in tcpSessions.values) {
-            if (isBlocked(session.uid)) session.reset()
+        for ((sock, uidOwner) in activeSockets.entries) {
+            if (isBlocked(uidOwner)) {
+                try { sock.close() } catch (_: Exception) {}
+            }
         }
     }
 
@@ -119,670 +100,225 @@ class PacketForwarder(
         return uid != fg
     }
 
-    private fun lookupUid(protocol: Int, srcIp: ByteArray, srcPort: Int, dstIp: ByteArray, dstPort: Int): Int {
+    private fun lookupUid(protocol: Int, srcPort: Int, dstIp: InetAddress, dstPort: Int): Int {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return UID_UNKNOWN
         val cm = connectivityManager ?: return UID_UNKNOWN
-
-        val isUdp = protocol == OsConstants.IPPROTO_UDP
-        val cacheKey = "u:$srcPort"
-        val now = System.currentTimeMillis()
-        if (isUdp) {
-            val cached = uidCache[cacheKey]
-            if (cached != null && now - cached.time < UID_CACHE_TTL_MS) return cached.uid
-        }
-
-        val uid = try {
-            cm.getConnectionOwnerUid(
-                protocol,
-                InetSocketAddress(InetAddress.getByAddress(srcIp), srcPort),
-                InetSocketAddress(InetAddress.getByAddress(dstIp), dstPort)
-            )
-        } catch (_: Exception) {
-            UID_UNKNOWN
-        }
-
-        if (isUdp && uid >= 0) {
-            if (uidCache.size > 1024) uidCache.clear()
-            uidCache[cacheKey] = CachedUid(uid, now)
-        }
-        return if (uid >= 0) uid else UID_UNKNOWN
-    }
-
-    private fun slotFor(uid: Int): Semaphore =
-        connectionSlots.getOrPut(uid) {
-            Semaphore(if (uid < 0) MAX_CONNECTIONS_UNKNOWN_UID else MAX_CONNECTIONS_PER_APP)
-        }
-
-    private fun seqDiff(a: Long, b: Long): Long = (a - b) and SEQ_MASK
-    private fun seqLt(a: Long, b: Long): Boolean = a != b && seqDiff(a, b) > 0x7FFFFFFFL
-    private fun seqLe(a: Long, b: Long): Boolean = a == b || seqLt(a, b)
-
-    private fun effectiveSpeedBytesPerSec(): Long {
-        val base = rateLimiter.bytesPerSecond.coerceAtLeast(1024L)
-        return if (rateLimiter.isBoostActive) base * 4L else base
-    }
-
-    private fun receiveWindowBytes(): Int =
-        (effectiveSpeedBytesPerSec() * 4 / 10).coerceIn(32L * 1024, 256L * 1024).toInt()
-
-    private fun writePacket(outputStream: FileOutputStream, pkt: ByteArray) {
-        synchronized(outputStream) {
+        val isIpv6 = dstIp.address.size == 16
+        val candidates = if (isIpv6) listOf("::1", "fd00:1:fd00:1:fd00:1:fd00:1") else listOf("10.0.0.2", "127.0.0.1")
+        for (localHost in candidates) {
             try {
-                outputStream.write(pkt)
+                val uid = cm.getConnectionOwnerUid(
+                    protocol,
+                    InetSocketAddress(InetAddress.getByName(localHost), srcPort),
+                    InetSocketAddress(dstIp, dstPort)
+                )
+                if (uid >= 0) return uid
             } catch (_: Exception) {}
         }
+        return UID_UNKNOWN
     }
 
-    private fun handleOutgoingPacket(rawPacket: ByteArray, outputStream: FileOutputStream) {
-        if (rawPacket.size < 20) return
-        val version = (rawPacket[0].toInt() shr 4) and 0x0F
+    private fun handleSocksClient(client: Socket) {
+        var remote: Socket? = null
+        var udpRelay: DatagramSocket? = null
+        try {
+            client.soTimeout = 30000
+            val inStream = client.getInputStream()
+            val outStream = client.getOutputStream()
 
-        if (version == 6) {
-            handleIpv6Packet(rawPacket, outputStream)
-            return
-        }
-        if (version != 4) return
+            val ver = inStream.read()
+            if (ver != 0x05) return
+            val nMethods = inStream.read()
+            if (nMethods <= 0) return
+            readExact(inStream, nMethods)
+            outStream.write(byteArrayOf(0x05, 0x00))
+            outStream.flush()
 
-        val ipHeaderLen = (rawPacket[0].toInt() and 0x0F) * 4
-        if (rawPacket.size < ipHeaderLen) return
-        val protocol = rawPacket[9].toInt() and 0xFF
-        val srcIp = ByteArray(4) { rawPacket[12 + it] }
-        val dstIp = ByteArray(4) { rawPacket[16 + it] }
+            val reqHead = readExact(inStream, 4)
+            if (reqHead[0].toInt() != 0x05) return
+            val cmd = reqHead[1].toInt() and 0xFF
+            val atyp = reqHead[3].toInt() and 0xFF
 
-        when (protocol) {
-            17 -> handleUdpPacket(rawPacket, ipHeaderLen, srcIp, dstIp, outputStream)
-            6 -> handleTcpPacket(rawPacket, ipHeaderLen, srcIp, dstIp, outputStream)
-        }
-    }
-
-    private fun handleIpv6Packet(rawPacket: ByteArray, outputStream: FileOutputStream) {
-        if (rawPacket.size < 40) return
-        val nextHeader = rawPacket[6].toInt() and 0xFF
-        if (nextHeader != 6 && nextHeader != 17) return
-        writePacket(outputStream, buildIcmp6Unreachable(rawPacket))
-    }
-
-    private fun handleUdpPacket(
-        rawPacket: ByteArray,
-        ipHeaderLen: Int,
-        srcIp: ByteArray,
-        dstIp: ByteArray,
-        outputStream: FileOutputStream
-    ) {
-        if (rawPacket.size < ipHeaderLen + 8) return
-        val srcPort = ((rawPacket[ipHeaderLen].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 1].toInt() and 0xFF)
-        val dstPort = ((rawPacket[ipHeaderLen + 2].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 3].toInt() and 0xFF)
-
-        if (dstPort == 443) {
-            writePacket(outputStream, buildIcmpPortUnreachable(rawPacket, ipHeaderLen))
-            return
-        }
-
-        val uid = lookupUid(OsConstants.IPPROTO_UDP, srcIp, srcPort, dstIp, dstPort)
-        if (isBlocked(uid)) {
-            writePacket(outputStream, buildIcmpPortUnreachable(rawPacket, ipHeaderLen))
-            return
-        }
-
-        val payloadOffset = ipHeaderLen + 8
-        val payloadLen = rawPacket.size - payloadOffset
-        if (payloadLen <= 0) return
-        val payload = rawPacket.copyOfRange(payloadOffset, rawPacket.size)
-
-        executor.execute {
-            var socket: DatagramSocket? = null
-            try {
-                socket = DatagramSocket()
-                vpnService.protect(socket)
-                socket.soTimeout = 5000
-
-                val dstAddress = InetAddress.getByAddress(dstIp)
-                socket.send(DatagramPacket(payload, payload.size, dstAddress, dstPort))
-                totalBytesTransferred.addAndGet(payload.size.toLong())
-
-                val respBuf = ByteArray(4096)
-                val respPacket = DatagramPacket(respBuf, respBuf.size)
-                socket.receive(respPacket)
-
-                if (isBlocked(uid)) return@execute
-
-                val respData = respPacket.data.copyOf(respPacket.length)
-                totalBytesTransferred.addAndGet(respData.size.toLong())
-                val ipResponse = buildUdpIpPacket(dstIp, dstPort, srcIp, srcPort, respData)
-                writePacket(outputStream, ipResponse)
-            } catch (_: Exception) {
-            } finally {
-                try { socket?.close() } catch (_: Exception) {}
+            val dstAddr: InetAddress = when (atyp) {
+                0x01 -> InetAddress.getByAddress(readExact(inStream, 4))
+                0x04 -> InetAddress.getByAddress(readExact(inStream, 16))
+                0x03 -> {
+                    val len = inStream.read()
+                    if (len <= 0) return
+                    val host = String(readExact(inStream, len), Charsets.UTF_8)
+                    InetAddress.getByName(host)
+                }
+                else -> return
             }
-        }
-    }
+            val portBytes = readExact(inStream, 2)
+            val dstPort = ((portBytes[0].toInt() and 0xFF) shl 8) or (portBytes[1].toInt() and 0xFF)
 
-    private fun handleTcpPacket(
-        rawPacket: ByteArray,
-        ipHeaderLen: Int,
-        srcIp: ByteArray,
-        dstIp: ByteArray,
-        outputStream: FileOutputStream
-    ) {
-        if (rawPacket.size < ipHeaderLen + 20) return
-        val srcPort = ((rawPacket[ipHeaderLen].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 1].toInt() and 0xFF)
-        val dstPort = ((rawPacket[ipHeaderLen + 2].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 3].toInt() and 0xFF)
-        val seqNum = ByteBuffer.wrap(rawPacket, ipHeaderLen + 4, 4).int.toLong() and 0xFFFFFFFFL
-        val tcpHeaderLen = ((rawPacket[ipHeaderLen + 12].toInt() shr 4) and 0x0F) * 4
-        if (rawPacket.size < ipHeaderLen + tcpHeaderLen) return
-        val flags = rawPacket[ipHeaderLen + 13].toInt() and 0xFF
-
-        val syn = (flags and 0x02) != 0
-        val ack = (flags and 0x10) != 0
-        val fin = (flags and 0x01) != 0
-        val rst = (flags and 0x04) != 0
-
-        val payloadOffset = ipHeaderLen + tcpHeaderLen
-        val payload = if (rawPacket.size > payloadOffset) {
-            rawPacket.copyOfRange(payloadOffset, rawPacket.size)
-        } else {
-            ByteArray(0)
-        }
-
-        val sessionKey = "${InetAddress.getByAddress(srcIp).hostAddress}:$srcPort-${InetAddress.getByAddress(dstIp).hostAddress}:$dstPort"
-
-        if (rst) {
-            tcpSessions.remove(sessionKey)?.close()
-            return
-        }
-
-        if (syn && !ack) {
-            val existing = tcpSessions[sessionKey]
-            if (existing != null && existing.clientIsn == seqNum) {
-                existing.resendSynAckIfConnected()
-                return
-            }
-            if (existing != null) {
-                tcpSessions.remove(sessionKey, existing)
-                existing.close()
-            }
-
-            val uid = lookupUid(OsConstants.IPPROTO_TCP, srcIp, srcPort, dstIp, dstPort)
-            if (isBlocked(uid)) {
-                val rstPkt = buildTcpIpPacket(
-                    dstIp, dstPort, srcIp, srcPort,
-                    0L, (seqNum + 1) and 0xFFFFFFFFL, 0x14, ByteArray(0)
+            if (cmd == 0x03) {
+                udpRelay = DatagramSocket(0, InetAddress.getByName("127.0.0.1"))
+                val relayPort = udpRelay.localPort
+                val reply = byteArrayOf(
+                    0x05, 0x00, 0x00, 0x01,
+                    127, 0, 0, 1,
+                    ((relayPort shr 8) and 0xFF).toByte(),
+                    (relayPort and 0xFF).toByte()
                 )
-                writePacket(outputStream, rstPkt)
+                outStream.write(reply)
+                outStream.flush()
+                relayUdpPackets(client, udpRelay)
                 return
             }
 
-            val session = TcpSession(sessionKey, uid, srcIp, srcPort, dstIp, dstPort, seqNum, outputStream)
-            tcpSessions[sessionKey] = session
-            executor.execute { session.connect() }
-            return
-        }
+            if (cmd != 0x01) {
+                outStream.write(byteArrayOf(0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                outStream.flush()
+                return
+            }
 
-        val session = tcpSessions[sessionKey] ?: return
+            val uid = lookupUid(OsConstants.IPPROTO_TCP, client.port, dstAddr, dstPort)
+            if (isBlocked(uid)) {
+                outStream.write(byteArrayOf(0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                outStream.flush()
+                return
+            }
 
-        if (isBlocked(session.uid)) {
-            session.reset()
-            return
-        }
+            val target = Socket()
+            remote = target
+            vpnService.protect(target)
+            target.tcpNoDelay = true
+            target.soTimeout = 60000
+            target.connect(InetSocketAddress(dstAddr, dstPort), 10000)
 
-        if (ack) {
-            val ackNum = ByteBuffer.wrap(rawPacket, ipHeaderLen + 8, 4).int.toLong() and 0xFFFFFFFFL
-            val window = ((rawPacket[ipHeaderLen + 14].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 15].toInt() and 0xFF)
-            session.onClientAck(ackNum, window, payload.isEmpty() && !fin)
-        }
+            activeSockets[target] = uid
+            activeSockets[client] = uid
 
-        if (fin) {
-            session.handleClientFin(seqNum)
-            tcpSessions.remove(sessionKey, session)
-            return
-        }
+            outStream.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+            outStream.flush()
+            client.soTimeout = 0
 
-        if (payload.isNotEmpty()) {
-            session.sendToRemote(payload, seqNum)
+            val upThread = Thread {
+                pipeStream(inStream, target.getOutputStream(), uid, limitRate = true, checkSessionLimit = false)
+            }.apply { start() }
+
+            pipeStream(target.getInputStream(), outStream, uid, limitRate = true, checkSessionLimit = true)
+            try { upThread.join(500) } catch (_: Exception) {}
+        } catch (_: Exception) {
+        } finally {
+            remote?.let { activeSockets.remove(it); try { it.close() } catch (_: Exception) {} }
+            activeSockets.remove(client)
+            try { client.close() } catch (_: Exception) {}
+            try { udpRelay?.close() } catch (_: Exception) {}
         }
     }
 
-    inner class TcpSession(
-        private val key: String,
-        val uid: Int,
-        private val clientIp: ByteArray,
-        private val clientPort: Int,
-        private val remoteIp: ByteArray,
-        private val remotePort: Int,
-        initialClientSeq: Long,
-        private val outputStream: FileOutputStream
+    private fun relayUdpPackets(tcpControl: Socket, localUdp: DatagramSocket) {
+        val upstream = DatagramSocket()
+        vpnService.protect(upstream)
+        upstream.soTimeout = 10000
+        var clientPacketAddr: InetSocketAddress? = null
+
+        val downThread = Thread {
+            val buf = ByteArray(8192)
+            val pkt = DatagramPacket(buf, buf.size)
+            while (running && !tcpControl.isClosed && !localUdp.isClosed) {
+                try {
+                    upstream.receive(pkt)
+                    val dest = clientPacketAddr ?: continue
+                    val srcAddrBytes = pkt.address.address
+                    val atyp: Byte = if (srcAddrBytes.size == 16) 0x04 else 0x01
+                    val header = ByteBuffer.allocate(4 + srcAddrBytes.size + 2 + pkt.length)
+                    header.put(0)
+                    header.put(0)
+                    header.put(0)
+                    header.put(atyp)
+                    header.put(srcAddrBytes)
+                    header.putShort(pkt.port.toShort())
+                    header.put(pkt.data, 0, pkt.length)
+                    val resp = header.array()
+                    rateLimiter.acquire(resp.size)
+                    totalBytesTransferred.addAndGet(pkt.length.toLong())
+                    localUdp.send(DatagramPacket(resp, resp.size, dest))
+                } catch (_: Exception) {
+                    if (tcpControl.isClosed || localUdp.isClosed) break
+                }
+            }
+        }.apply { start() }
+
+        try {
+            val buf = ByteArray(8192)
+            val pkt = DatagramPacket(buf, buf.size)
+            while (running && !tcpControl.isClosed) {
+                localUdp.receive(pkt)
+                clientPacketAddr = InetSocketAddress(pkt.address, pkt.port)
+                if (pkt.length < 10) continue
+                val atyp = buf[3].toInt() and 0xFF
+                var offset = 4
+                val dstAddr: InetAddress = when (atyp) {
+                    0x01 -> { val a = buf.copyOfRange(offset, offset + 4); offset += 4; InetAddress.getByAddress(a) }
+                    0x04 -> { val a = buf.copyOfRange(offset, offset + 16); offset += 16; InetAddress.getByAddress(a) }
+                    0x03 -> { val l = buf[offset].toInt() and 0xFF; offset++; val h = String(buf, offset, l); offset += l; InetAddress.getByName(h) }
+                    else -> continue
+                }
+                val dstPort = ((buf[offset].toInt() and 0xFF) shl 8) or (buf[offset + 1].toInt() and 0xFF)
+                offset += 2
+                val payloadLen = pkt.length - offset
+                if (payloadLen <= 0) continue
+
+                val uid = lookupUid(OsConstants.IPPROTO_UDP, pkt.port, dstAddr, dstPort)
+                if (isBlocked(uid)) continue
+
+                rateLimiter.acquire(payloadLen)
+                totalBytesTransferred.addAndGet(payloadLen.toLong())
+                upstream.send(DatagramPacket(buf, offset, payloadLen, dstAddr, dstPort))
+            }
+        } catch (_: Exception) {
+        } finally {
+            try { upstream.close() } catch (_: Exception) {}
+            try { downThread.interrupt() } catch (_: Exception) {}
+        }
+    }
+
+    private fun pipeStream(
+        input: InputStream,
+        output: OutputStream,
+        uid: Int,
+        limitRate: Boolean,
+        checkSessionLimit: Boolean
     ) {
-        val clientIsn: Long = initialClientSeq
-
-        private val socket = Socket()
-        private val initialSeq: Long = 10000L
-        @Volatile private var mySeq: Long = initialSeq
-        @Volatile private var clientNextSeq: Long = (initialClientSeq + 1) and SEQ_MASK
-        private var totalDownloadedBytes: Long = 0L
-        private val slot: Semaphore = slotFor(uid)
-        private val slotHeld = AtomicBoolean(false)
-
-        @Volatile private var connected = false
-        @Volatile private var closed = false
-        @Volatile private var handshakeDone = false
-
-        private val flowLock = ReentrantLock()
-        private val flowChanged = flowLock.newCondition()
-        private val unacked = ArrayDeque<Segment>()
-        private var sndUna: Long = (initialSeq + 1) and SEQ_MASK
-        private var clientWindow: Int = 65535
-        private var dupAcks = 0
-        private var retries = 0
-        private var lastProgress = 0L
-
-        fun connect() {
-            try {
-                if (!slot.tryAcquire(SLOT_WAIT_SECONDS, TimeUnit.SECONDS)) {
-                    if (!closed) sendRst()
-                    return
-                }
-                slotHeld.set(true)
-
-                if (closed || !running) return
-
-                vpnService.protect(socket)
-                socket.tcpNoDelay = true
-                socket.receiveBufferSize = receiveWindowBytes()
-                socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 8000)
-                if (closed) return
-                connected = true
-
-                flowLock.withLock {
-                    mySeq = (initialSeq + 1) and SEQ_MASK
-                    sndUna = mySeq
-                    lastProgress = System.currentTimeMillis()
-                }
-                val synAck = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, initialSeq, clientNextSeq, 0x12, ByteArray(0))
-                writeToTun(synAck)
-                handshakeDone = true
-
-                val inStream = socket.getInputStream()
-                val buffer = ByteArray(MAX_PAYLOAD)
-                while (running && connected && !socket.isClosed) {
-                    val read = inStream.read(buffer)
-                    if (read == -1) {
-                        waitForDrain(DRAIN_WAIT_MS)
-                        val finSeq = flowLock.withLock {
-                            val s = mySeq
-                            mySeq = (mySeq + 1) and SEQ_MASK
-                            s
-                        }
-                        val finPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, finSeq, clientNextSeq, 0x11, ByteArray(0))
-                        writeToTun(finPkt)
+        val buf = ByteArray(IO_BUFFER_SIZE)
+        var sessionBytes = 0L
+        try {
+            while (running) {
+                if (isBlocked(uid)) break
+                val read = input.read(buf)
+                if (read == -1) break
+                if (read > 0) {
+                    if (checkSessionLimit && maxSessionBytes != Long.MAX_VALUE && sessionBytes >= maxSessionBytes) {
                         break
                     }
-                    if (read > 0) {
-                        if (isBlocked(uid)) {
-                            sendRst()
-                            break
-                        }
-                        if (maxSessionBytes != Long.MAX_VALUE && totalDownloadedBytes >= maxSessionBytes) {
-                            sendRst()
-                            break
-                        }
-                        if (!waitForWindow(read)) break
+                    if (limitRate) {
                         rateLimiter.acquire(read)
-                        totalDownloadedBytes += read
-                        totalBytesTransferred.addAndGet(read.toLong())
-                        sendData(buffer.copyOf(read))
                     }
-                }
-            } catch (_: Exception) {
-                if (!handshakeDone && !closed) sendRst()
-            } finally {
-                close()
-                tcpSessions.remove(key, this)
-            }
-        }
-
-        private fun sendData(chunk: ByteArray) {
-            val seg = flowLock.withLock {
-                val s = Segment(mySeq, chunk)
-                if (unacked.isEmpty()) lastProgress = System.currentTimeMillis()
-                unacked.addLast(s)
-                mySeq = (mySeq + chunk.size) and SEQ_MASK
-                s
-            }
-            writeSegment(seg)
-        }
-
-        private fun writeSegment(seg: Segment) {
-            val pkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, seg.seq, clientNextSeq, 0x18, seg.data)
-            writeToTun(pkt)
-        }
-
-        private fun waitForWindow(len: Int): Boolean {
-            flowLock.withLock {
-                while (!closed && running) {
-                    val inflight = seqDiff(mySeq, sndUna)
-                    if (inflight + len <= clientWindow.toLong()) return true
-                    flowChanged.await(200, TimeUnit.MILLISECONDS)
+                    sessionBytes += read
+                    totalBytesTransferred.addAndGet(read.toLong())
+                    output.write(buf, 0, read)
+                    output.flush()
                 }
             }
-            return false
-        }
-
-        private fun waitForDrain(maxMs: Long) {
-            val deadline = System.currentTimeMillis() + maxMs
-            flowLock.withLock {
-                while (!closed && !unacked.isEmpty() && System.currentTimeMillis() < deadline) {
-                    flowChanged.await(100, TimeUnit.MILLISECONDS)
-                }
-            }
-        }
-
-        fun onClientAck(ack: Long, window: Int, pureAck: Boolean) {
-            if (!connected) return
-            var fastRetransmit: Segment? = null
-            flowLock.withLock {
-                val scaledWin = if (window > 0) (window shl 4).coerceAtMost(262144) else 0
-                clientWindow = maxOf(window, scaledWin)
-                if (seqLt(sndUna, ack) && seqLe(ack, mySeq)) {
-                    sndUna = ack
-                    while (true) {
-                        val first = unacked.peekFirst() ?: break
-                        val end = (first.seq + first.data.size) and SEQ_MASK
-                        if (seqLe(end, ack)) unacked.pollFirst() else break
-                    }
-                    dupAcks = 0
-                    retries = 0
-                    lastProgress = System.currentTimeMillis()
-                } else if (pureAck && ack == sndUna && !unacked.isEmpty()) {
-                    dupAcks++
-                    if (dupAcks == 3) fastRetransmit = unacked.peekFirst()
-                }
-                flowChanged.signalAll()
-            }
-            fastRetransmit?.let { writeSegment(it) }
-        }
-
-        fun checkRetransmit() {
-            if (closed || !connected) return
-            var toResend: List<Segment> = emptyList()
-            var giveUp = false
-            flowLock.withLock {
-                if (!unacked.isEmpty()) {
-                    val now = System.currentTimeMillis()
-                    val rto = minOf(RTO_MIN_MS shl minOf(retries, 4), RTO_MAX_MS)
-                    if (now - lastProgress >= rto) {
-                        retries++
-                        lastProgress = now
-                        if (retries > MAX_RETRIES) {
-                            giveUp = true
-                        } else {
-                            val list = ArrayList<Segment>()
-                            for (s in unacked) {
-                                if (list.size >= RETRANS_BURST) break
-                                list.add(s)
-                            }
-                            toResend = list
-                        }
-                    }
-                }
-            }
-            if (giveUp) {
-                reset()
-                return
-            }
-            for (seg in toResend) writeSegment(seg)
-        }
-
-        fun resendSynAckIfConnected() {
-            if (!connected || closed) return
-            val synAck = buildTcpIpPacket(
-                remoteIp, remotePort, clientIp, clientPort,
-                initialSeq, (clientIsn + 1) and SEQ_MASK, 0x12, ByteArray(0)
-            )
-            writeToTun(synAck)
-        }
-
-        @Synchronized
-        fun sendToRemote(data: ByteArray, seq: Long) {
-            if (!connected || closed || socket.isClosed) return
-            try {
-                if (seq == clientNextSeq) {
-                    clientNextSeq = (seq + data.size) and SEQ_MASK
-                    socket.getOutputStream().write(data)
-                    socket.getOutputStream().flush()
-                    totalBytesTransferred.addAndGet(data.size.toLong())
-                }
-                val ackPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x10, ByteArray(0))
-                writeToTun(ackPkt)
-            } catch (_: Exception) {
-                close()
-            }
-        }
-
-        @Synchronized
-        fun handleClientFin(seq: Long) {
-            try {
-                clientNextSeq = (seq + 1) and SEQ_MASK
-                val finAck = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x11, ByteArray(0))
-                writeToTun(finAck)
-            } catch (_: Exception) {}
-            close()
-        }
-
-        fun reset() {
-            sendRst()
-            close()
-            tcpSessions.remove(key, this)
-        }
-
-        private fun sendRst() {
-            val rstPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x14, ByteArray(0))
-            writeToTun(rstPkt)
-        }
-
-        private fun writeToTun(pkt: ByteArray) {
-            writePacket(outputStream, pkt)
-        }
-
-        private fun releaseSlot() {
-            if (slotHeld.compareAndSet(true, false)) {
-                try { slot.release() } catch (_: Exception) {}
-            }
-        }
-
-        fun close() {
-            closed = true
-            connected = false
-            releaseSlot()
-            try {
-                socket.close()
-            } catch (_: Exception) {}
-            flowLock.withLock { flowChanged.signalAll() }
+        } catch (_: Exception) {
+        } finally {
+            try { output.close() } catch (_: Exception) {}
+            try { input.close() } catch (_: Exception) {}
         }
     }
 
-    private fun buildUdpIpPacket(srcIp: ByteArray, srcPort: Int, dstIp: ByteArray, dstPort: Int, payload: ByteArray): ByteArray {
-        val udpLen = 8 + payload.size
-        val totalLen = 20 + udpLen
-        val buf = ByteBuffer.allocate(totalLen)
-
-        buf.put(0x45.toByte())
-        buf.put(0x00.toByte())
-        buf.putShort(totalLen.toShort())
-        buf.putShort(0)
-        buf.putShort(0x4000.toShort())
-        buf.put(64.toByte())
-        buf.put(17.toByte())
-        buf.putShort(0)
-        buf.put(srcIp)
-        buf.put(dstIp)
-
-        val ipChecksum = computeChecksum(buf.array(), 0, 20)
-        buf.putShort(10, ipChecksum)
-
-        buf.putShort(srcPort.toShort())
-        buf.putShort(dstPort.toShort())
-        buf.putShort(udpLen.toShort())
-        buf.putShort(0)
-        buf.put(payload)
-
-        return buf.array()
-    }
-
-    private fun buildTcpIpPacket(
-        srcIp: ByteArray,
-        srcPort: Int,
-        dstIp: ByteArray,
-        dstPort: Int,
-        seq: Long,
-        ack: Long,
-        flags: Int,
-        payload: ByteArray
-    ): ByteArray {
-        val totalLen = 40 + payload.size
-        val buf = ByteBuffer.allocate(totalLen)
-
-        buf.put(0x45.toByte())
-        buf.put(0x00.toByte())
-        buf.putShort(totalLen.toShort())
-        buf.putShort(0)
-        buf.putShort(0x4000.toShort())
-        buf.put(64.toByte())
-        buf.put(6.toByte())
-        buf.putShort(0)
-        buf.put(srcIp)
-        buf.put(dstIp)
-
-        val ipChecksum = computeChecksum(buf.array(), 0, 20)
-        buf.putShort(10, ipChecksum)
-
-        buf.putShort(srcPort.toShort())
-        buf.putShort(dstPort.toShort())
-        buf.putInt(seq.toInt())
-        buf.putInt(ack.toInt())
-        buf.put(0x50.toByte())
-        buf.put(flags.toByte())
-        buf.putShort(32768.toShort())
-        buf.putShort(0)
-        buf.putShort(0)
-        buf.put(payload)
-
-        val tcpChecksum = computeTcpChecksum(srcIp, dstIp, buf.array(), 20, 20 + payload.size)
-        buf.putShort(36, tcpChecksum)
-
-        return buf.array()
-    }
-
-    private fun buildIcmpPortUnreachable(orig: ByteArray, ipHeaderLen: Int): ByteArray {
-        val embedded = minOf(orig.size, ipHeaderLen + 8)
-        val icmpLen = 8 + embedded
-        val totalLen = 20 + icmpLen
-        val buf = ByteBuffer.allocate(totalLen)
-
-        buf.put(0x45.toByte())
-        buf.put(0x00.toByte())
-        buf.putShort(totalLen.toShort())
-        buf.putShort(0)
-        buf.putShort(0x4000.toShort())
-        buf.put(64.toByte())
-        buf.put(1.toByte())
-        buf.putShort(0)
-        buf.put(orig, 16, 4)
-        buf.put(orig, 12, 4)
-
-        buf.putShort(10, computeChecksum(buf.array(), 0, 20))
-
-        buf.put(3.toByte())
-        buf.put(3.toByte())
-        buf.putShort(0)
-        buf.putInt(0)
-        buf.put(orig, 0, embedded)
-
-        buf.putShort(22, computeChecksum(buf.array(), 20, icmpLen))
-        return buf.array()
-    }
-
-    private fun buildIcmp6Unreachable(orig: ByteArray): ByteArray {
-        val embedded = minOf(orig.size, 200)
-        val icmpLen = 8 + embedded
-        val buf = ByteBuffer.allocate(40 + icmpLen)
-
-        buf.putInt(0x60000000)
-        buf.putShort(icmpLen.toShort())
-        buf.put(58.toByte())
-        buf.put(64.toByte())
-        buf.put(orig, 24, 16)
-        buf.put(orig, 8, 16)
-
-        buf.put(1.toByte())
-        buf.put(4.toByte())
-        buf.putShort(0)
-        buf.putInt(0)
-        buf.put(orig, 0, embedded)
-
-        buf.putShort(42, computeIcmp6Checksum(buf.array(), 40, icmpLen))
-        return buf.array()
-    }
-
-    private fun computeIcmp6Checksum(packet: ByteArray, icmpOffset: Int, icmpLen: Int): Short {
-        var sum = 0L
-        var i = 8
-        while (i < 40) {
-            sum += ((packet[i].toInt() and 0xFF) shl 8) or (packet[i + 1].toInt() and 0xFF)
-            i += 2
+    private fun readExact(input: InputStream, len: Int): ByteArray {
+        val data = ByteArray(len)
+        var off = 0
+        while (off < len) {
+            val r = input.read(data, off, len - off)
+            if (r <= 0) throw java.io.EOFException()
+            off += r
         }
-        sum += icmpLen.toLong()
-        sum += 58L
-
-        i = icmpOffset
-        while (i < icmpOffset + icmpLen - 1) {
-            sum += ((packet[i].toInt() and 0xFF) shl 8) or (packet[i + 1].toInt() and 0xFF)
-            i += 2
-        }
-        if (icmpLen % 2 == 1) {
-            sum += (packet[icmpOffset + icmpLen - 1].toInt() and 0xFF) shl 8
-        }
-        while ((sum shr 16) != 0L) {
-            sum = (sum and 0xFFFF) + (sum shr 16)
-        }
-        return (sum.inv() and 0xFFFF).toShort()
-    }
-
-    private fun computeChecksum(data: ByteArray, offset: Int, length: Int): Short {
-        var sum = 0L
-        var i = offset
-        while (i < offset + length - 1) {
-            sum += ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
-            i += 2
-        }
-        if (length % 2 == 1) {
-            sum += (data[offset + length - 1].toInt() and 0xFF) shl 8
-        }
-        while ((sum shr 16) != 0L) {
-            sum = (sum and 0xFFFF) + (sum shr 16)
-        }
-        return (sum.inv() and 0xFFFF).toShort()
-    }
-
-    private fun computeTcpChecksum(srcIp: ByteArray, dstIp: ByteArray, data: ByteArray, tcpOffset: Int, tcpLength: Int): Short {
-        var sum = 0L
-        for (i in 0 until 4 step 2) {
-            sum += ((srcIp[i].toInt() and 0xFF) shl 8) or (srcIp[i + 1].toInt() and 0xFF)
-            sum += ((dstIp[i].toInt() and 0xFF) shl 8) or (dstIp[i + 1].toInt() and 0xFF)
-        }
-        sum += 6L
-        sum += tcpLength.toLong()
-
-        var i = tcpOffset
-        while (i < tcpOffset + tcpLength - 1) {
-            sum += ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
-            i += 2
-        }
-        if (tcpLength % 2 == 1) {
-            sum += (data[tcpOffset + tcpLength - 1].toInt() and 0xFF) shl 8
-        }
-        while ((sum shr 16) != 0L) {
-            sum = (sum and 0xFFFF) + (sum shr 16)
-        }
-        return (sum.inv() and 0xFFFF).toShort()
+        return data
     }
 }

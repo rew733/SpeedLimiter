@@ -16,8 +16,8 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.os.Process
-import java.io.FileInputStream
-import java.io.FileOutputStream
+import hev.htproxy.TProxyService
+import java.io.File
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -26,7 +26,6 @@ import java.util.concurrent.TimeUnit
 class MyVpnService : VpnService() {
 
     private var vpnInterface: ParcelFileDescriptor? = null
-    private var vpnThread: Thread? = null
     private var packetForwarder: PacketForwarder? = null
     private var rateLimiter: RateLimiter? = null
     private var wakeLock: PowerManager.WakeLock? = null
@@ -41,6 +40,7 @@ class MyVpnService : VpnService() {
     private var lastEventQueryTime: Long = 0L
 
     @Volatile private var usageAccessGranted: Boolean = true
+    @Volatile private var tproxyRunning: Boolean = false
 
     companion object {
         @Volatile
@@ -278,6 +278,22 @@ class MyVpnService : VpnService() {
         } catch (_: Exception) {}
     }
 
+    private fun writeTProxyConfig(socksPort: Int): File {
+        val configFile = File(cacheDir, "tproxy.conf")
+        val configText = """
+            misc:
+              task-stack-size: 81920
+            tunnel:
+              mtu: 1500
+            socks5:
+              port: $socksPort
+              address: '127.0.0.1'
+              udp: 'udp'
+        """.trimIndent()
+        configFile.writeText(configText)
+        return configFile
+    }
+
     private fun startVpn(
         targetPackages: List<String>,
         bgKillPackages: List<String>,
@@ -302,7 +318,9 @@ class MyVpnService : VpnService() {
         val limiter = RateLimiter(speedKb.toLong() * 1024L)
         rateLimiter = limiter
         val maxSessionBytes = if (sessionLimitKb > 0) sessionLimitKb.toLong() * 1024L else Long.MAX_VALUE
-        packetForwarder = PacketForwarder(this, limiter, maxSessionBytes, speedUids, bgBlockedUids)
+        val forwarder = PacketForwarder(this, limiter, maxSessionBytes, speedUids, bgBlockedUids)
+        val socksPort = forwarder.startServer()
+        packetForwarder = forwarder
 
         val builder = Builder()
             .setSession("SpeedLimiter")
@@ -312,7 +330,7 @@ class MyVpnService : VpnService() {
             .addRoute("::", 0)
             .addDnsServer("8.8.8.8")
             .addDnsServer("1.1.1.1")
-            .setMtu(1400)
+            .setMtu(1500)
             .setBlocking(true)
 
         var addedApps = 0
@@ -335,27 +353,21 @@ class MyVpnService : VpnService() {
         }
         vpnInterface = iface
 
-        vpnThread = Thread({
-            val fd = vpnInterface?.fileDescriptor ?: return@Thread
-            val inputStream = FileInputStream(fd)
-            val outputStream = FileOutputStream(fd)
-            try {
-                packetForwarder?.start(inputStream, outputStream)
-            } catch (_: Exception) {}
-        }, "VpnTunnelThread").apply {
-            priority = Thread.MAX_PRIORITY
-            start()
-        }
+        val configFile = writeTProxyConfig(socksPort)
+        TProxyService.TProxyStartService(configFile.absolutePath, iface.fd)
+        tproxyRunning = true
         return true
     }
 
     private fun cleanupTunnel() {
         stopLiveMonitor()
+        if (tproxyRunning) {
+            tproxyRunning = false
+            try { TProxyService.TProxyStopService() } catch (_: Exception) {}
+        }
         packetForwarder?.stop()
         packetForwarder = null
         rateLimiter = null
-        vpnThread?.interrupt()
-        vpnThread = null
         try { vpnInterface?.close() } catch (_: Exception) {}
         vpnInterface = null
     }
