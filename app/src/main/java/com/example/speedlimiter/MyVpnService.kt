@@ -1,6 +1,7 @@
 package com.example.speedlimiter
 
 import android.app.ActivityManager
+import android.app.AppOpsManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -98,6 +99,21 @@ class MyVpnService : VpnService() {
         return START_REDELIVER_INTENT
     }
 
+    private fun hasUsageStatsPermission(): Boolean {
+        return try {
+            val appOps = getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager ?: return false
+            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                appOps.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), packageName)
+            } else {
+                @Suppress("DEPRECATION")
+                appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), packageName)
+            }
+            mode == AppOpsManager.MODE_ALLOWED
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     private fun registerScreenStateReceiver() {
         unregisterScreenStateReceiver()
         screenReceiver = object : BroadcastReceiver() {
@@ -152,27 +168,29 @@ class MyVpnService : VpnService() {
     }
 
     private fun detectForegroundPackageName(): String? {
-        try {
-            val usm = getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
-            if (usm != null) {
-                val now = System.currentTimeMillis()
-                val events = usm.queryEvents(now - 15_000L, now)
-                val event = UsageEvents.Event()
-                var latestPkg: String? = null
-                var latestTime = 0L
-                while (events.hasNextEvent()) {
-                    events.getNextEvent(event)
-                    if (event.eventType == UsageEvents.Event.ACTIVITY_RESUMED && event.timeStamp >= latestTime) {
-                        latestTime = event.timeStamp
-                        latestPkg = event.packageName
+        if (hasUsageStatsPermission()) {
+            try {
+                val usm = getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
+                if (usm != null) {
+                    val now = System.currentTimeMillis()
+                    val events = usm.queryEvents(now - 30_000L, now)
+                    val event = UsageEvents.Event()
+                    var latestPkg: String? = null
+                    var latestTime = 0L
+                    while (events.hasNextEvent()) {
+                        events.getNextEvent(event)
+                        if (event.eventType == UsageEvents.Event.ACTIVITY_RESUMED && event.timeStamp >= latestTime) {
+                            latestTime = event.timeStamp
+                            latestPkg = event.packageName
+                        }
+                    }
+                    if (latestPkg != null) {
+                        lastDetectedForegroundPkg = latestPkg
+                        return latestPkg
                     }
                 }
-                if (latestPkg != null) {
-                    lastDetectedForegroundPkg = latestPkg
-                    return latestPkg
-                }
-            }
-        } catch (_: Exception) {}
+            } catch (_: Exception) {}
+        }
 
         try {
             val am = getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
@@ -198,6 +216,9 @@ class MyVpnService : VpnService() {
         val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
         val screenInteractive = pm?.isInteractive ?: true
         forwarder.isScreenOn = screenInteractive
+
+        val usagePerm = hasUsageStatsPermission()
+        forwarder.hasUsagePermission = usagePerm
 
         if (!screenInteractive) {
             forwarder.activeForegroundUid = Process.INVALID_UID

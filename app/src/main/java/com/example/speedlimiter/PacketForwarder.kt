@@ -33,6 +33,7 @@ class PacketForwarder(
     @Volatile private var running = false
     @Volatile var isScreenOn = true
     @Volatile var activeForegroundUid: Int = Process.INVALID_UID
+    @Volatile var hasUsagePermission: Boolean = false
 
     val totalBytesTransferred = AtomicLong(0L)
 
@@ -46,14 +47,14 @@ class PacketForwarder(
                 val entry = it.next()
                 val sessionUid = uidSessionMap[entry.key] ?: Process.INVALID_UID
                 val expired = now - entry.value.lastActivityTime > 45_000L
-                val noLongerForeground = !isScreenOn || !isUidPermittedNow(sessionUid)
-                if (expired || noLongerForeground) {
+                val noLongerPermitted = !isScreenOn || !isUidPermittedNow(sessionUid)
+                if (expired || noLongerPermitted) {
                     entry.value.close()
                     it.remove()
                     uidSessionMap.remove(entry.key)
                 }
             }
-        }, 3, 3, TimeUnit.SECONDS)
+        }, 2, 2, TimeUnit.SECONDS)
 
         val packet = ByteBuffer.allocate(32767)
 
@@ -125,28 +126,37 @@ class PacketForwarder(
         }
     }
 
+    /**
+     * جدار الحماية الذكي للواجهة المباشرة فقط (Smart Foreground-Only Firewall):
+     * 1. الشاشة مغلقة -> قطع فوري لجميع التطبيقات.
+     * 2. خدمات النظام الأساسية (uid < FIRST_APPLICATION_UID) -> تمر دون المساس باستقرار النظام.
+     * 3. إذا كان إذن Usage Access مفعّلاً وتم تحديد التطبيق المفتوح في المقدمة (activeForegroundUid != INVALID_UID):
+     *    - إذا كان هذا التطبيق المفتوح غير محظور نهائياً، يُفتح له الإنترنت فوراً بالسرعة المحددة (حتى لو كان محظوراً في الخلفية).
+     *    - أي تطبيق آخر في الخلفية يُحظر فوراً وتُقطع عنه البيانات.
+     * 4. إذا لم يُمنح إذن Usage Access بعد:
+     *    - يُسمح للتطبيقات المختارة في قائمة السرعة (allowedUids) بالعمل دون انقطاع، بينما تُحظر بقية التطبيقات.
+     */
     private fun isUidPermittedNow(uid: Int): Boolean {
         if (!isScreenOn) return false
 
-        // السماح بالمرور عبر النفق المقيد إذا لم يتمكن النظام من تحديد UID الحزمة
-        // لتجنب قطع الإنترنت كلياً عن الجهاز مع استمرار عمل قاتل الخلفية كل ثانيتين
         if (uid == Process.INVALID_UID) return true
-
-        if (blockedUids.contains(uid)) return false
 
         if (uid < Process.FIRST_APPLICATION_UID) {
             return true
         }
 
-        if (!allowedUids.contains(uid)) {
+        if (hasUsagePermission && activeForegroundUid != Process.INVALID_UID) {
+            // التطبيق المفتوح حالياً على الشاشة يُسمح له بالعمل بالسرعة المحددة (ما لم يكن محظوراً كلياً)
+            if (uid == activeForegroundUid) {
+                return true
+            }
+            // أي تطبيق آخر ليس في المقدمة يُحظر فوراً باعتباره في الخلفية
             return false
         }
 
-        if (activeForegroundUid != Process.INVALID_UID && uid != activeForegroundUid) {
-            return false
-        }
-
-        return true
+        // الوضع الاحتياطي عند عدم تفعيل إذن Usage Access:
+        if (blockedUids.contains(uid)) return false
+        return allowedUids.contains(uid)
     }
 
     private fun handleOutgoingPacket(rawPacket: ByteArray, outputStream: FileOutputStream) {
