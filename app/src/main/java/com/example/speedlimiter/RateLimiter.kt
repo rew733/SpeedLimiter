@@ -2,9 +2,23 @@ package com.example.speedlimiter
 
 import android.os.SystemClock
 
-class RateLimiter(private val maxBytesPerSecond: Long) {
+class RateLimiter(initialBytesPerSecond: Long) {
+    @Volatile
+    private var maxBytesPerSecond: Long = initialBytesPerSecond.coerceAtLeast(1024L)
     private var availableTokens: Double = maxBytesPerSecond.toDouble()
     private var lastRefillTime: Long = SystemClock.elapsedRealtime()
+
+    @Synchronized
+    fun setSpeedLimitKbps(kbps: Long) {
+        maxBytesPerSecond = (kbps * 1024L).coerceAtLeast(1024L)
+        availableTokens = availableTokens.coerceAtMost(maxBytesPerSecond.toDouble())
+        lastRefillTime = SystemClock.elapsedRealtime()
+    }
+
+    @Synchronized
+    fun getSpeedLimitKbps(): Long {
+        return maxBytesPerSecond / 1024L
+    }
 
     @Synchronized
     fun throttle(bytesNum: Int) {
