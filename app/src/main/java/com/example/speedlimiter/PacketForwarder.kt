@@ -507,7 +507,7 @@ class PacketForwarder(
     ) {
         private val socket = Socket()
         private var mySeq: Long = 10000L
-        private var clientNextSeq: Long = (initialClientSeq + 1) and 0xFFFFFFFFL
+        private var clientNextSeq: Long = (initialSeq + 1) and 0xFFFFFFFFL
         private var totalDownloadedBytes: Long = 0L
         @Volatile var lastActivityTime: Long = System.currentTimeMillis()
         @Volatile private var connected = false
