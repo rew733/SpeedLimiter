@@ -88,7 +88,7 @@ class MyVpnService : VpnService() {
         savedAllowedPackages = targetPackages.filter { !bgKillPackages.contains(it) && it != packageName }
         launcherPackages = resolveLauncherPackages()
 
-        killBackgroundProcesses(getBlockedNonForegroundPackages())
+        killBackgroundProcesses(getAllManagedBackgroundPackages())
 
         cleanupTunnel()
         acquireWakeLock()
@@ -138,8 +138,7 @@ class MyVpnService : VpnService() {
                         packetForwarder?.isScreenOn = false
                         packetForwarder?.activeForegroundUid = Process.INVALID_UID
                         packetForwarder?.closeAllSessionsImmediately()
-                        killBackgroundProcesses(savedBgKillPackages)
-                        killBackgroundProcesses(savedAllowedPackages)
+                        killBackgroundProcesses(getAllManagedPackages())
                     }
                     Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
                         val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
@@ -170,9 +169,17 @@ class MyVpnService : VpnService() {
         screenReceiver = null
     }
 
-    private fun getBlockedNonForegroundPackages(): List<String> {
+    private fun getAllManagedPackages(): List<String> {
+        return LinkedHashSet<String>().apply {
+            addAll(savedAllowedPackages)
+            addAll(savedBgKillPackages)
+            remove(packageName)
+        }.toList()
+    }
+
+    private fun getAllManagedBackgroundPackages(): List<String> {
         val fgPkg = detectForegroundPackageName()
-        return savedBgKillPackages.filter { it != fgPkg && it != packageName }
+        return getAllManagedPackages().filter { it != fgPkg }
     }
 
     private fun detectForegroundPackageName(): String? {
@@ -222,6 +229,10 @@ class MyVpnService : VpnService() {
         return lastDetectedForegroundPkg
     }
 
+    /**
+     * عند فتح تطبيق: يُرفع عنه الحظر مؤقتاً ويُصبح هو التطبيق النشط المسموح له بالسرعة المحددة.
+     * عند إغلاقه أو الخروج منه: تُغلق جلساته فوراً ويعود إلى حكم تطبيقات الخلفية المحظورة.
+     */
     private fun updateForegroundAppState() {
         val forwarder = packetForwarder ?: return
         val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
@@ -233,6 +244,7 @@ class MyVpnService : VpnService() {
 
         if (!screenInteractive) {
             forwarder.activeForegroundUid = Process.INVALID_UID
+            forwarder.closeAllSessionsImmediately()
             return
         }
 
@@ -242,9 +254,10 @@ class MyVpnService : VpnService() {
         }
 
         if (launcherPackages.contains(fgPkg)) {
-            if (forwarder.activeForegroundUid != Process.INVALID_UID) {
-                forwarder.activeForegroundUid = Process.INVALID_UID
-                forwarder.closeAllSessionsImmediately()
+            val prevUid = forwarder.activeForegroundUid
+            forwarder.activeForegroundUid = Process.INVALID_UID
+            if (prevUid != Process.INVALID_UID) {
+                forwarder.closeSessionsForUid(prevUid)
             }
             return
         }
@@ -254,7 +267,7 @@ class MyVpnService : VpnService() {
             val prevUid = forwarder.activeForegroundUid
             forwarder.activeForegroundUid = appInfo.uid
             if (prevUid != Process.INVALID_UID && prevUid != appInfo.uid) {
-                forwarder.refreshSessions()
+                forwarder.closeSessionsForUid(prevUid)
             }
         } catch (_: Exception) {}
     }
@@ -264,7 +277,7 @@ class MyVpnService : VpnService() {
         try {
             updateForegroundAppState()
             packetForwarder?.refreshSessions()
-            killBackgroundProcesses(getBlockedNonForegroundPackages())
+            killBackgroundProcesses(getAllManagedBackgroundPackages())
             System.gc()
             refreshNotificationNow()
         } catch (_: Exception) {}
@@ -290,9 +303,9 @@ class MyVpnService : VpnService() {
             if (!isServiceRunning) return@scheduleWithFixedDelay
             try {
                 updateForegroundAppState()
-                killBackgroundProcesses(getBlockedNonForegroundPackages())
+                killBackgroundProcesses(getAllManagedBackgroundPackages())
             } catch (_: Exception) {}
-        }, 3, 4, TimeUnit.SECONDS)
+        }, 2, 2, TimeUnit.SECONDS)
     }
 
     private fun stopBackgroundEnforcer() {

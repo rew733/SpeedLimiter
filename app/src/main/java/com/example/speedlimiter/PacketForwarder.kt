@@ -48,14 +48,14 @@ class PacketForwarder(
                 val entry = it.next()
                 val sessionUid = uidSessionMap[entry.key] ?: Process.INVALID_UID
                 val expired = now - entry.value.lastActivityTime > 120_000L
-                val screenOffOrBlocked = !isScreenOn || isExplicitlyBlocked(sessionUid)
-                if (expired || screenOffOrBlocked) {
+                val isBlockedNow = !isScreenOn || isUidBlockedInBackground(sessionUid)
+                if (expired || isBlockedNow) {
                     entry.value.close()
                     it.remove()
                     uidSessionMap.remove(entry.key)
                 }
             }
-        }, 5, 5, TimeUnit.SECONDS)
+        }, 2, 2, TimeUnit.SECONDS)
 
         val packet = ByteBuffer.allocate(32767)
 
@@ -77,6 +77,19 @@ class PacketForwarder(
         }
     }
 
+    fun closeSessionsForUid(targetUid: Int) {
+        if (targetUid == Process.INVALID_UID) return
+        val it = tcpSessions.entries.iterator()
+        while (it.hasNext()) {
+            val entry = it.next()
+            if (uidSessionMap[entry.key] == targetUid) {
+                entry.value.close()
+                it.remove()
+                uidSessionMap.remove(entry.key)
+            }
+        }
+    }
+
     fun closeAllSessionsImmediately() {
         val it = tcpSessions.entries.iterator()
         while (it.hasNext()) {
@@ -93,7 +106,7 @@ class PacketForwarder(
         while (it.hasNext()) {
             val entry = it.next()
             val sessionUid = uidSessionMap[entry.key] ?: Process.INVALID_UID
-            if (now - entry.value.lastActivityTime > 60_000L || !isScreenOn || isExplicitlyBlocked(sessionUid)) {
+            if (now - entry.value.lastActivityTime > 60_000L || !isScreenOn || isUidBlockedInBackground(sessionUid)) {
                 entry.value.close()
                 it.remove()
                 uidSessionMap.remove(entry.key)
@@ -127,30 +140,33 @@ class PacketForwarder(
         }
     }
 
-    private fun isExplicitlyBlocked(uid: Int): Boolean {
+    /**
+     * منطق التبديل اللحظي بين "مسموح له بالمرور عبر النفق المقيّد" و"محظور في الخلفية":
+     * - عند إطفاء الشاشة: يُحظر الجميع وتُغلق الجلسات.
+     * - خدمات النظام الأساسية (uid < FIRST_APPLICATION_UID): تمر دون تعطيل الجهاز.
+     * - التطبيق المفتوح حالياً في المقدمة (activeForegroundUid): يُرفع عنه الحظر مؤقتاً ويُسمح له بالمرور بالسرعة المحددة.
+     * - أي تطبيق مستخدم آخر ليس في المقدمة: يُعد في حكم "محظور في الخلفية" وتُغلق جلساته فوراً.
+     * - إذا لم يكن إذن Usage Access مفعلاً بعد: يُسمح لتطبيقات allowedUids بالعمل ويُحظر blockedUids.
+     */
+    private fun isUidBlockedInBackground(uid: Int): Boolean {
         if (!isScreenOn) return true
         if (uid == Process.INVALID_UID || uid < Process.FIRST_APPLICATION_UID) return false
 
-        // إذا كان التطبيق هو التطبيق النشط حالياً في المقدمة، اسمح له بالعمل بالسرعة المحددة
-        if (hasUsagePermission && activeForegroundUid != Process.INVALID_UID && uid == activeForegroundUid) {
-            return false
+        if (activeForegroundUid != Process.INVALID_UID) {
+            return uid != activeForegroundUid
         }
 
-        // حظر صريح لتطبيقات الخلفية المحددة
-        if (blockedUids.contains(uid)) {
+        if (hasUsagePermission) {
             return true
         }
 
-        // إذا تم تحديد قائمة تطبيقات للسرعة، احظر باقي تطبيقات المستخدم غير المحددة في الخلفية
-        if (allowedUids.isNotEmpty() && !allowedUids.contains(uid)) {
-            return true
-        }
-
+        if (blockedUids.contains(uid)) return true
+        if (allowedUids.isNotEmpty() && !allowedUids.contains(uid)) return true
         return false
     }
 
     private fun isUidPermittedNow(uid: Int): Boolean {
-        return !isExplicitlyBlocked(uid)
+        return !isUidBlockedInBackground(uid)
     }
 
     private fun handleOutgoingPacket(rawPacket: ByteArray, outputStream: FileOutputStream) {
@@ -309,7 +325,6 @@ class PacketForwarder(
             return
         }
 
-        // عدم إسقاط UDP 443 بإرسال ICMP خطأ حتى لا تتوقف بروتوكولات الشبكة الحديثة
         if (dstPort != 53) return
 
         val payloadOffset = ipHeaderLen + 8
