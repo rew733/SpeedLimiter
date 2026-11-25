@@ -1,6 +1,9 @@
-package com.example.speedlimiter
+packet_forwarder_code = """package com.example.speedlimiter
 
+import android.net.ConnectivityManager
 import android.net.VpnService
+import android.os.Build
+import android.os.Process
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.DatagramPacket
@@ -18,7 +21,9 @@ import java.util.concurrent.atomic.AtomicLong
 class PacketForwarder(
     private val vpnService: VpnService,
     private val rateLimiter: RateLimiter,
-    private val maxSessionBytes: Long = Long.MAX_VALUE
+    private val maxSessionBytes: Long = Long.MAX_VALUE,
+    private val blockedUids: Set<Int> = emptySet(),
+    private val connectivityManager: ConnectivityManager? = null
 ) {
     private val executor = Executors.newCachedThreadPool()
     private val cleaner: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
@@ -30,7 +35,6 @@ class PacketForwarder(
     fun start(inputStream: FileInputStream, outputStream: FileOutputStream) {
         running = true
 
-        // تنظيف الجلسات الخاملة فقط (التي توقفت لأكثر من 60 ثانية) دون قطع الجلسات النشطة
         cleaner.scheduleWithFixedDelay({
             val now = System.currentTimeMillis()
             val it = tcpSessions.entries.iterator()
@@ -63,7 +67,6 @@ class PacketForwarder(
         }
     }
 
-    // تنظيف الجلسات المتراكمة غير النشطة فقط دون قطع البث أو الردود الجارية
     fun refreshSessions() {
         val now = System.currentTimeMillis()
         val it = tcpSessions.entries.iterator()
@@ -86,6 +89,25 @@ class PacketForwarder(
             it.remove()
         }
         try { executor.shutdownNow() } catch (_: Exception) {}
+    }
+
+    private fun isPacketFromBlockedApp(
+        protocol: Int,
+        srcIp: ByteArray,
+        srcPort: Int,
+        dstIp: ByteArray,
+        dstPort: Int
+    ): Boolean {
+        if (blockedUids.isEmpty() || connectivityManager == null) return false
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
+        return try {
+            val local = InetSocketAddress(InetAddress.getByAddress(srcIp), srcPort)
+            val remote = InetSocketAddress(InetAddress.getByAddress(dstIp), dstPort)
+            val uid = connectivityManager.getConnectionOwnerUid(protocol, local, remote)
+            uid != Process.INVALID_UID && blockedUids.contains(uid)
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun handleOutgoingPacket(rawPacket: ByteArray, outputStream: FileOutputStream) {
@@ -116,7 +138,11 @@ class PacketForwarder(
         val srcPort = ((rawPacket[ipHeaderLen].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 1].toInt() and 0xFF)
         val dstPort = ((rawPacket[ipHeaderLen + 2].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 3].toInt() and 0xFF)
 
-        // إرسال رفض فوري (ICMP Port Unreachable) لبروتوكول QUIC (UDP 443) لتحويل يوتيوب وGemini فوراً إلى TCP
+        // Zero-Data Blackhole: إسقاط فوري لأي حزمة UDP صادرة من تطبيقات حظر الخلفية
+        if (isPacketFromBlockedApp(17, srcIp, srcPort, dstIp, dstPort)) {
+            return
+        }
+
         if (dstPort == 443) {
             val icmpUnreachable = buildIcmpPortUnreachable(rawPacket, ipHeaderLen)
             if (icmpUnreachable != null) {
@@ -239,14 +265,25 @@ class PacketForwarder(
         val fin = (flags and 0x01) != 0
         val rst = (flags and 0x04) != 0
 
+        val sessionKey = "${InetAddress.getByAddress(srcIp).hostAddress}:$srcPort-${InetAddress.getByAddress(dstIp).hostAddress}:$dstPort"
+
+        // Zero-Data Blackhole: منع أي حزمة TCP صادرة من تطبيقات حظر الخلفية وإرسال RST فوري لإنهاء المحاولة
+        if (isPacketFromBlockedApp(6, srcIp, srcPort, dstIp, dstPort)) {
+            tcpSessions.remove(sessionKey)?.close()
+            if (!rst) {
+                val nextSeq = (seqNum + 1) and 0xFFFFFFFFL
+                val rstPkt = buildTcpIpPacket(dstIp, dstPort, srcIp, srcPort, 0L, nextSeq, 0x14, ByteArray(0))
+                writeToTunSafe(outputStream, rstPkt)
+            }
+            return
+        }
+
         val payloadOffset = ipHeaderLen + tcpHeaderLen
         val payload = if (rawPacket.size > payloadOffset) {
             rawPacket.copyOfRange(payloadOffset, rawPacket.size)
         } else {
             ByteArray(0)
         }
-
-        val sessionKey = "${InetAddress.getByAddress(srcIp).hostAddress}:$srcPort-${InetAddress.getByAddress(dstIp).hostAddress}:$dstPort"
 
         if (rst) {
             tcpSessions.remove(sessionKey)?.close()
@@ -296,7 +333,6 @@ class PacketForwarder(
                 rateLimiter.acquire(512)
                 vpnService.protect(socket)
                 socket.tcpNoDelay = true
-                // مهلة 45 ثانية لمنع انقطاع الردود الطويلة في Gemini أو البث المباشر
                 socket.soTimeout = 45000
                 socket.receiveBufferSize = 4096
                 socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 6000)
@@ -517,3 +553,9 @@ class PacketForwarder(
         return (sum.inv() and 0xFFFF).toShort()
     }
 }
+"""
+
+with open("PacketForwarder.kt", "w", encoding="utf-8") as f:
+    f.write(packet_forwarder_code)
+
+print("PacketForwarder.kt generated successfully")
