@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.net.VpnService
+import android.os.Build
 import android.os.Bundle
 import android.text.InputType
 import android.view.Gravity
@@ -91,7 +92,7 @@ class MainActivity : Activity() {
         rootLayout.addView(toggleButton, btnParams)
 
         val appsHeader = TextView(this).apply {
-            text = "قائمة التطبيقات المثبتة:"
+            text = "قائمة التطبيقات المثبتة (غير النظامية):"
             textSize = 16f
             setTypeface(typeface, Typeface.BOLD)
             setTextColor(Color.BLACK)
@@ -112,11 +113,23 @@ class MainActivity : Activity() {
         }
 
         val pm = packageManager
-        val packages = pm.getInstalledApplications(PackageManager.GET_META_DATA)
-            .filter { (it.flags and ApplicationInfo.FLAG_SYSTEM) == 0 || it.packageName == "com.android.chrome" }
+        val installedApps: List<ApplicationInfo> = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            pm.getInstalledApplications(PackageManager.ApplicationInfoFlags.of(0L))
+        } else {
+            @Suppress("DEPRECATION")
+            pm.getInstalledApplications(0)
+        }
+
+        val userPackages = installedApps
+            .filter { app ->
+                val isSystem = (app.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+                val isUpdatedSystem = (app.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
+                val isSelf = app.packageName == packageName
+                !isSystem && !isUpdatedSystem && !isSelf
+            }
             .sortedBy { pm.getApplicationLabel(it).toString().lowercase() }
 
-        for (appInfo in packages) {
+        for (appInfo in userPackages) {
             val label = pm.getApplicationLabel(appInfo).toString()
             val pkgName = appInfo.packageName
             val checkBox = CheckBox(this).apply {
