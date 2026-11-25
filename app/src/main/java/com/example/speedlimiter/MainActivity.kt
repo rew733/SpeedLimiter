@@ -5,17 +5,17 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.Bundle
 import android.widget.Button
-import androidx.appcompat.app.AppCompatActivity
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : Activity() {
 
     private val vpnRequestCode = 1001
     private var isVpnActive = false
+    private lateinit var toggleButton: Button
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val toggleButton = Button(this).apply {
+        toggleButton = Button(this).apply {
             text = "تشغيل SpeedLimiter VPN"
             textSize = 18f
         }
@@ -27,7 +27,7 @@ class MainActivity : AppCompatActivity() {
                 if (prepareIntent != null) {
                     startActivityForResult(prepareIntent, vpnRequestCode)
                 } else {
-                    startSpeedLimiterVpn(toggleButton)
+                    startSpeedLimiterVpn()
                 }
             } else {
                 stopService(Intent(this, MyVpnService::class.java))
@@ -37,17 +37,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == vpnRequestCode && resultCode == Activity.RESULT_OK) {
-            val button = findViewById<Button>(android.R.id.content)
-            startSpeedLimiterVpn(button)
+        if (requestCode == vpnRequestCode && resultCode == RESULT_OK) {
+            startSpeedLimiterVpn()
         }
     }
 
-    private fun startSpeedLimiterVpn(button: Button?) {
+    private fun startSpeedLimiterVpn() {
         startService(Intent(this, MyVpnService::class.java))
         isVpnActive = true
-        button?.text = "إيقاف SpeedLimiter VPN"
+        toggleButton.text = "إيقاف SpeedLimiter VPN"
     }
 }
