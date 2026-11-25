@@ -12,6 +12,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
+import java.util.TreeMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -46,7 +47,7 @@ class PacketForwarder(
             while (it.hasNext()) {
                 val entry = it.next()
                 val sessionUid = uidSessionMap[entry.key] ?: Process.INVALID_UID
-                val expired = now - entry.value.lastActivityTime > 60_000L
+                val expired = now - entry.value.lastActivityTime > 90_000L
                 val noLongerPermitted = !isScreenOn || !isUidPermittedNow(sessionUid)
                 if (expired || noLongerPermitted) {
                     entry.value.close()
@@ -92,7 +93,7 @@ class PacketForwarder(
         while (it.hasNext()) {
             val entry = it.next()
             val sessionUid = uidSessionMap[entry.key] ?: Process.INVALID_UID
-            if (now - entry.value.lastActivityTime > 30_000L || !isScreenOn || !isUidPermittedNow(sessionUid)) {
+            if (now - entry.value.lastActivityTime > 45_000L || !isScreenOn || !isUidPermittedNow(sessionUid)) {
                 entry.value.close()
                 it.remove()
                 uidSessionMap.remove(entry.key)
@@ -135,25 +136,12 @@ class PacketForwarder(
             return true
         }
 
-        if (blockedUids.contains(uid)) {
-            if (hasUsagePermission && activeForegroundUid != Process.INVALID_UID && uid == activeForegroundUid) {
-                return true
-            }
-            return false
+        if (hasUsagePermission && activeForegroundUid != Process.INVALID_UID) {
+            return uid == activeForegroundUid
         }
 
-        if (allowedUids.contains(uid)) {
-            if (hasUsagePermission && activeForegroundUid != Process.INVALID_UID && uid != activeForegroundUid) {
-                return false
-            }
-            return true
-        }
-
-        if (hasUsagePermission && activeForegroundUid != Process.INVALID_UID && uid == activeForegroundUid) {
-            return true
-        }
-
-        return false
+        if (blockedUids.contains(uid)) return false
+        return allowedUids.contains(uid)
     }
 
     private fun handleOutgoingPacket(rawPacket: ByteArray, outputStream: FileOutputStream) {
@@ -462,7 +450,13 @@ class PacketForwarder(
         }
 
         if (syn && !ack) {
-            tcpSessions.remove(sessionKey)?.close()
+            val existing = tcpSessions[sessionKey]
+            // منع تكرار SYN (Retransmission) من تدمير جلسة قيد الاتصال
+            if (existing != null && existing.initialSeq == seqNum) {
+                existing.resendSynAckIfReady()
+                return
+            }
+            existing?.close()
             val session = TcpSession(sessionKey, ownerUid, srcIp, srcPort, dstIp, dstPort, seqNum, outputStream)
             tcpSessions[sessionKey] = session
             uidSessionMap[sessionKey] = ownerUid
@@ -492,24 +486,33 @@ class PacketForwarder(
         private val clientPort: Int,
         private val remoteIp: ByteArray,
         private val remotePort: Int,
-        initialClientSeq: Long,
+        val initialSeq: Long,
         private val outputStream: FileOutputStream
     ) {
         private val socket = Socket()
         private var mySeq: Long = 10000L
-        private var clientNextSeq: Long = (initialClientSeq + 1) and 0xFFFFFFFFL
+        private var clientNextSeq: Long = (initialSeq + 1) and 0xFFFFFFFFL
         private var totalDownloadedBytes: Long = 0L
+        private val outOfOrderBuffer = TreeMap<Long, ByteArray>()
         @Volatile var lastActivityTime: Long = System.currentTimeMillis()
         @Volatile private var connected = false
+
+        fun resendSynAckIfReady() {
+            if (connected) {
+                val synAck = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, 10000L, clientNextSeq, 0x12, ByteArray(0))
+                writeToTunSafe(outputStream, synAck)
+            }
+        }
 
         fun connect() {
             try {
                 if (!isUidPermittedNow(ownerUid)) return
-                rateLimiter.acquire(256)
+                // عدم خصم رصيد من RateLimiter أثناء مصافحة TCP/TLS حتى لا تتعثر التطبيقات عند الفتح
                 vpnService.protect(socket)
                 socket.tcpNoDelay = true
                 socket.soTimeout = 60000
-                socket.receiveBufferSize = 8192
+                socket.receiveBufferSize = 32768
+                socket.sendBufferSize = 16384
                 socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 15000)
                 connected = true
                 lastActivityTime = System.currentTimeMillis()
@@ -519,7 +522,7 @@ class PacketForwarder(
                 writeToTunSafe(outputStream, synAck)
 
                 val inStream = socket.getInputStream()
-                val buffer = ByteArray(1200)
+                val buffer = ByteArray(1300)
                 while (running && connected && !socket.isClosed) {
                     if (!isUidPermittedNow(ownerUid)) {
                         val rstPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x14, ByteArray(0))
@@ -540,6 +543,7 @@ class PacketForwarder(
                             writeToTunSafe(outputStream, rstPkt)
                             break
                         }
+                        // تطبيق سقف السرعة بدقة على بيانات التحميل فقط
                         rateLimiter.acquire(read)
                         totalDownloadedBytes += read
                         totalBytesTransferred.addAndGet(read.toLong())
@@ -567,17 +571,26 @@ class PacketForwarder(
             try {
                 lastActivityTime = System.currentTimeMillis()
                 if (seq == clientNextSeq) {
-                    rateLimiter.acquire(data.size)
-                    clientNextSeq = (seq + data.size) and 0xFFFFFFFFL
-                    socket.getOutputStream().write(data)
-                    socket.getOutputStream().flush()
-                    totalBytesTransferred.addAndGet(data.size.toLong())
+                    writeOrderedChunk(data, seq)
+                    while (outOfOrderBuffer.containsKey(clientNextSeq)) {
+                        val nextChunk = outOfOrderBuffer.remove(clientNextSeq) ?: break
+                        writeOrderedChunk(nextChunk, clientNextSeq)
+                    }
+                } else if (seq > clientNextSeq && outOfOrderBuffer.size < 16) {
+                    outOfOrderBuffer[seq] = data
                 }
                 val ackPkt = buildTcpIpPacket(remoteIp, remotePort, clientIp, clientPort, mySeq, clientNextSeq, 0x10, ByteArray(0))
                 writeToTunSafe(outputStream, ackPkt)
             } catch (_: Exception) {
                 close()
             }
+        }
+
+        private fun writeOrderedChunk(data: ByteArray, seq: Long) {
+            clientNextSeq = (seq + data.size) and 0xFFFFFFFFL
+            socket.getOutputStream().write(data)
+            socket.getOutputStream().flush()
+            totalBytesTransferred.addAndGet(data.size.toLong())
         }
 
         @Synchronized
@@ -592,6 +605,7 @@ class PacketForwarder(
 
         fun close() {
             connected = false
+            outOfOrderBuffer.clear()
             try {
                 socket.close()
             } catch (_: Exception) {}
@@ -688,7 +702,7 @@ class PacketForwarder(
         buf.putInt(ack.toInt())
         buf.put(0x50.toByte())
         buf.put(flags.toByte())
-        buf.putShort(4096.toShort())
+        buf.putShort(32768.toShort())
         buf.putShort(0)
         buf.putShort(0)
         buf.put(payload)

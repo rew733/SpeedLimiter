@@ -12,6 +12,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.VpnService
@@ -44,6 +45,7 @@ class MyVpnService : VpnService() {
     private var savedAllowedPackages: List<String> = emptyList()
     private var savedBgKillPackages: List<String> = emptyList()
     private var lastDetectedForegroundPkg: String? = null
+    private var launcherPackages: Set<String> = emptySet()
 
     companion object {
         @Volatile
@@ -84,6 +86,7 @@ class MyVpnService : VpnService() {
         currentLimitKb = speedKb
         savedBgKillPackages = bgKillPackages
         savedAllowedPackages = targetPackages.filter { !bgKillPackages.contains(it) && it != packageName }
+        launcherPackages = resolveLauncherPackages()
 
         killBackgroundProcesses(getBlockedNonForegroundPackages())
 
@@ -97,6 +100,18 @@ class MyVpnService : VpnService() {
         startBackgroundEnforcer()
 
         return START_REDELIVER_INTENT
+    }
+
+    private fun resolveLauncherPackages(): Set<String> {
+        val result = HashSet<String>()
+        try {
+            val homeIntent = Intent(Intent.ACTION_MAIN).apply { addCategory(Intent.CATEGORY_HOME) }
+            val resolveInfos = packageManager.queryIntentActivities(homeIntent, PackageManager.MATCH_DEFAULT_ONLY)
+            for (info in resolveInfos) {
+                info.activityInfo?.packageName?.let { result.add(it) }
+            }
+        } catch (_: Exception) {}
+        return result
     }
 
     private fun hasUsageStatsPermission(): Boolean {
@@ -166,15 +181,19 @@ class MyVpnService : VpnService() {
                 val usm = getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
                 if (usm != null) {
                     val now = System.currentTimeMillis()
-                    val events = usm.queryEvents(now - 60_000L, now)
+                    // البحث في آخر 15 دقيقة حتى لا يفقد التطبيق المفتوح إذا بقي المستخدم بداخله طويلاً
+                    val events = usm.queryEvents(now - 900_000L, now)
                     val event = UsageEvents.Event()
                     var latestPkg: String? = null
                     var latestTime = 0L
                     while (events.hasNextEvent()) {
                         events.getNextEvent(event)
                         if (event.eventType == UsageEvents.Event.ACTIVITY_RESUMED && event.timeStamp >= latestTime) {
-                            latestTime = event.timeStamp
-                            latestPkg = event.packageName
+                            val pkg = event.packageName
+                            if (pkg != null && pkg != "android" && pkg != "com.android.systemui") {
+                                latestTime = event.timeStamp
+                                latestPkg = pkg
+                            }
                         }
                     }
                     if (latestPkg != null) {
@@ -192,7 +211,7 @@ class MyVpnService : VpnService() {
                 for (proc in runningApps) {
                     if (proc.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND) {
                         val pkg = proc.pkgList?.firstOrNull()
-                        if (pkg != null) {
+                        if (pkg != null && pkg != "android" && pkg != "com.android.systemui") {
                             lastDetectedForegroundPkg = pkg
                             return pkg
                         }
@@ -218,8 +237,17 @@ class MyVpnService : VpnService() {
             return
         }
 
-        val fgPkg = detectForegroundPackageName()
-        if (fgPkg == null || fgPkg == packageName) {
+        val fgPkg = detectForegroundPackageName() ?: return
+        if (fgPkg == packageName) {
+            return
+        }
+
+        // إذا خرج المستخدم إلى الشاشة الرئيسية (Launcher)، أوقف تمرير بيانات التطبيقات فوراً
+        if (launcherPackages.contains(fgPkg)) {
+            if (forwarder.activeForegroundUid != Process.INVALID_UID) {
+                forwarder.activeForegroundUid = Process.INVALID_UID
+                forwarder.closeAllSessionsImmediately()
+            }
             return
         }
 
