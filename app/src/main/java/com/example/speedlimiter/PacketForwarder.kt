@@ -46,7 +46,7 @@ class PacketForwarder(
             while (it.hasNext()) {
                 val entry = it.next()
                 val sessionUid = uidSessionMap[entry.key] ?: Process.INVALID_UID
-                val expired = now - entry.value.lastActivityTime > 45_000L
+                val expired = now - entry.value.lastActivityTime > 60_000L
                 val noLongerPermitted = !isScreenOn || !isUidPermittedNow(sessionUid)
                 if (expired || noLongerPermitted) {
                     entry.value.close()
@@ -54,7 +54,7 @@ class PacketForwarder(
                     uidSessionMap.remove(entry.key)
                 }
             }
-        }, 2, 2, TimeUnit.SECONDS)
+        }, 5, 5, TimeUnit.SECONDS)
 
         val packet = ByteBuffer.allocate(32767)
 
@@ -92,7 +92,7 @@ class PacketForwarder(
         while (it.hasNext()) {
             val entry = it.next()
             val sessionUid = uidSessionMap[entry.key] ?: Process.INVALID_UID
-            if (now - entry.value.lastActivityTime > 20_000L || !isScreenOn || !isUidPermittedNow(sessionUid)) {
+            if (now - entry.value.lastActivityTime > 30_000L || !isScreenOn || !isUidPermittedNow(sessionUid)) {
                 entry.value.close()
                 it.remove()
                 uidSessionMap.remove(entry.key)
@@ -126,16 +126,6 @@ class PacketForwarder(
         }
     }
 
-    /**
-     * جدار الحماية الذكي للواجهة المباشرة فقط (Smart Foreground-Only Firewall):
-     * 1. الشاشة مغلقة -> قطع فوري لجميع التطبيقات.
-     * 2. خدمات النظام الأساسية (uid < FIRST_APPLICATION_UID) -> تمر دون المساس باستقرار النظام.
-     * 3. إذا كان إذن Usage Access مفعّلاً وتم تحديد التطبيق المفتوح في المقدمة (activeForegroundUid != INVALID_UID):
-     *    - إذا كان هذا التطبيق المفتوح غير محظور نهائياً، يُفتح له الإنترنت فوراً بالسرعة المحددة (حتى لو كان محظوراً في الخلفية).
-     *    - أي تطبيق آخر في الخلفية يُحظر فوراً وتُقطع عنه البيانات.
-     * 4. إذا لم يُمنح إذن Usage Access بعد:
-     *    - يُسمح للتطبيقات المختارة في قائمة السرعة (allowedUids) بالعمل دون انقطاع، بينما تُحظر بقية التطبيقات.
-     */
     private fun isUidPermittedNow(uid: Int): Boolean {
         if (!isScreenOn) return false
 
@@ -145,18 +135,25 @@ class PacketForwarder(
             return true
         }
 
-        if (hasUsagePermission && activeForegroundUid != Process.INVALID_UID) {
-            // التطبيق المفتوح حالياً على الشاشة يُسمح له بالعمل بالسرعة المحددة (ما لم يكن محظوراً كلياً)
-            if (uid == activeForegroundUid) {
+        if (blockedUids.contains(uid)) {
+            if (hasUsagePermission && activeForegroundUid != Process.INVALID_UID && uid == activeForegroundUid) {
                 return true
             }
-            // أي تطبيق آخر ليس في المقدمة يُحظر فوراً باعتباره في الخلفية
             return false
         }
 
-        // الوضع الاحتياطي عند عدم تفعيل إذن Usage Access:
-        if (blockedUids.contains(uid)) return false
-        return allowedUids.contains(uid)
+        if (allowedUids.contains(uid)) {
+            if (hasUsagePermission && activeForegroundUid != Process.INVALID_UID && uid != activeForegroundUid) {
+                return false
+            }
+            return true
+        }
+
+        if (hasUsagePermission && activeForegroundUid != Process.INVALID_UID && uid == activeForegroundUid) {
+            return true
+        }
+
+        return false
     }
 
     private fun handleOutgoingPacket(rawPacket: ByteArray, outputStream: FileOutputStream) {
@@ -342,7 +339,7 @@ class PacketForwarder(
             try {
                 socket = DatagramSocket()
                 vpnService.protect(socket)
-                socket.soTimeout = 2000
+                socket.soTimeout = 3000
 
                 val dstAddress = InetAddress.getByAddress(dstIp)
                 socket.send(DatagramPacket(payload, payload.size, dstAddress, dstPort))
@@ -508,12 +505,12 @@ class PacketForwarder(
         fun connect() {
             try {
                 if (!isUidPermittedNow(ownerUid)) return
-                rateLimiter.acquire(512)
+                rateLimiter.acquire(256)
                 vpnService.protect(socket)
                 socket.tcpNoDelay = true
-                socket.soTimeout = 45000
-                socket.receiveBufferSize = 4096
-                socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 6000)
+                socket.soTimeout = 60000
+                socket.receiveBufferSize = 8192
+                socket.connect(InetSocketAddress(InetAddress.getByAddress(remoteIp), remotePort), 15000)
                 connected = true
                 lastActivityTime = System.currentTimeMillis()
 

@@ -85,7 +85,7 @@ class MyVpnService : VpnService() {
         savedBgKillPackages = bgKillPackages
         savedAllowedPackages = targetPackages.filter { !bgKillPackages.contains(it) && it != packageName }
 
-        killBackgroundProcesses(getAllNonForegroundManagedPackages())
+        killBackgroundProcesses(getBlockedNonForegroundPackages())
 
         cleanupTunnel()
         acquireWakeLock()
@@ -123,7 +123,8 @@ class MyVpnService : VpnService() {
                         packetForwarder?.isScreenOn = false
                         packetForwarder?.activeForegroundUid = Process.INVALID_UID
                         packetForwarder?.closeAllSessionsImmediately()
-                        killBackgroundProcesses(getAllManagedPackages())
+                        killBackgroundProcesses(savedBgKillPackages)
+                        killBackgroundProcesses(savedAllowedPackages)
                     }
                     Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
                         val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
@@ -154,17 +155,9 @@ class MyVpnService : VpnService() {
         screenReceiver = null
     }
 
-    private fun getAllManagedPackages(): List<String> {
-        return LinkedHashSet<String>().apply {
-            addAll(savedAllowedPackages)
-            addAll(savedBgKillPackages)
-            remove(packageName)
-        }.toList()
-    }
-
-    private fun getAllNonForegroundManagedPackages(): List<String> {
+    private fun getBlockedNonForegroundPackages(): List<String> {
         val fgPkg = detectForegroundPackageName()
-        return getAllManagedPackages().filter { it != fgPkg }
+        return savedBgKillPackages.filter { it != fgPkg && it != packageName }
     }
 
     private fun detectForegroundPackageName(): String? {
@@ -173,7 +166,7 @@ class MyVpnService : VpnService() {
                 val usm = getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
                 if (usm != null) {
                     val now = System.currentTimeMillis()
-                    val events = usm.queryEvents(now - 30_000L, now)
+                    val events = usm.queryEvents(now - 60_000L, now)
                     val event = UsageEvents.Event()
                     var latestPkg: String? = null
                     var latestTime = 0L
@@ -227,7 +220,6 @@ class MyVpnService : VpnService() {
 
         val fgPkg = detectForegroundPackageName()
         if (fgPkg == null || fgPkg == packageName) {
-            forwarder.activeForegroundUid = Process.INVALID_UID
             return
         }
 
@@ -238,9 +230,7 @@ class MyVpnService : VpnService() {
             if (prevUid != Process.INVALID_UID && prevUid != appInfo.uid) {
                 forwarder.refreshSessions()
             }
-        } catch (_: Exception) {
-            forwarder.activeForegroundUid = Process.INVALID_UID
-        }
+        } catch (_: Exception) {}
     }
 
     private fun performInternalRefresh() {
@@ -248,7 +238,7 @@ class MyVpnService : VpnService() {
         try {
             updateForegroundAppState()
             packetForwarder?.refreshSessions()
-            killBackgroundProcesses(getAllNonForegroundManagedPackages())
+            killBackgroundProcesses(getBlockedNonForegroundPackages())
             System.gc()
             refreshNotificationNow()
         } catch (_: Exception) {}
@@ -274,9 +264,9 @@ class MyVpnService : VpnService() {
             if (!isServiceRunning) return@scheduleWithFixedDelay
             try {
                 updateForegroundAppState()
-                killBackgroundProcesses(getAllNonForegroundManagedPackages())
+                killBackgroundProcesses(getBlockedNonForegroundPackages())
             } catch (_: Exception) {}
-        }, 1, 2, TimeUnit.SECONDS)
+        }, 2, 3, TimeUnit.SECONDS)
     }
 
     private fun stopBackgroundEnforcer() {
