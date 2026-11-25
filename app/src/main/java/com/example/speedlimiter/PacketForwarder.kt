@@ -47,9 +47,9 @@ class PacketForwarder(
             while (it.hasNext()) {
                 val entry = it.next()
                 val sessionUid = uidSessionMap[entry.key] ?: Process.INVALID_UID
-                val expired = now - entry.value.lastActivityTime > 90_000L
-                val noLongerPermitted = !isScreenOn || !isUidPermittedNow(sessionUid)
-                if (expired || noLongerPermitted) {
+                val expired = now - entry.value.lastActivityTime > 120_000L
+                val screenOffOrBlocked = !isScreenOn || isExplicitlyBlocked(sessionUid)
+                if (expired || screenOffOrBlocked) {
                     entry.value.close()
                     it.remove()
                     uidSessionMap.remove(entry.key)
@@ -93,7 +93,7 @@ class PacketForwarder(
         while (it.hasNext()) {
             val entry = it.next()
             val sessionUid = uidSessionMap[entry.key] ?: Process.INVALID_UID
-            if (now - entry.value.lastActivityTime > 45_000L || !isScreenOn || !isUidPermittedNow(sessionUid)) {
+            if (now - entry.value.lastActivityTime > 60_000L || !isScreenOn || isExplicitlyBlocked(sessionUid)) {
                 entry.value.close()
                 it.remove()
                 uidSessionMap.remove(entry.key)
@@ -127,21 +127,30 @@ class PacketForwarder(
         }
     }
 
-    private fun isUidPermittedNow(uid: Int): Boolean {
-        if (!isScreenOn) return false
+    private fun isExplicitlyBlocked(uid: Int): Boolean {
+        if (!isScreenOn) return true
+        if (uid == Process.INVALID_UID || uid < Process.FIRST_APPLICATION_UID) return false
 
-        if (uid == Process.INVALID_UID) return true
+        // إذا كان التطبيق هو التطبيق النشط حالياً في المقدمة، اسمح له بالعمل بالسرعة المحددة
+        if (hasUsagePermission && activeForegroundUid != Process.INVALID_UID && uid == activeForegroundUid) {
+            return false
+        }
 
-        if (uid < Process.FIRST_APPLICATION_UID) {
+        // حظر صريح لتطبيقات الخلفية المحددة
+        if (blockedUids.contains(uid)) {
             return true
         }
 
-        if (hasUsagePermission && activeForegroundUid != Process.INVALID_UID) {
-            return uid == activeForegroundUid
+        // إذا تم تحديد قائمة تطبيقات للسرعة، احظر باقي تطبيقات المستخدم غير المحددة في الخلفية
+        if (allowedUids.isNotEmpty() && !allowedUids.contains(uid)) {
+            return true
         }
 
-        if (blockedUids.contains(uid)) return false
-        return allowedUids.contains(uid)
+        return false
+    }
+
+    private fun isUidPermittedNow(uid: Int): Boolean {
+        return !isExplicitlyBlocked(uid)
     }
 
     private fun handleOutgoingPacket(rawPacket: ByteArray, outputStream: FileOutputStream) {
@@ -300,14 +309,7 @@ class PacketForwarder(
             return
         }
 
-        if (dstPort == 443) {
-            val icmpUnreachable = buildIcmpPortUnreachable(rawPacket, ipHeaderLen)
-            if (icmpUnreachable != null) {
-                writeToTunSafe(outputStream, icmpUnreachable)
-            }
-            return
-        }
-
+        // عدم إسقاط UDP 443 بإرسال ICMP خطأ حتى لا تتوقف بروتوكولات الشبكة الحديثة
         if (dstPort != 53) return
 
         val payloadOffset = ipHeaderLen + 8
@@ -451,7 +453,6 @@ class PacketForwarder(
 
         if (syn && !ack) {
             val existing = tcpSessions[sessionKey]
-            // منع تكرار SYN (Retransmission) من تدمير جلسة قيد الاتصال
             if (existing != null && existing.initialSeq == seqNum) {
                 existing.resendSynAckIfReady()
                 return
@@ -507,7 +508,6 @@ class PacketForwarder(
         fun connect() {
             try {
                 if (!isUidPermittedNow(ownerUid)) return
-                // عدم خصم رصيد من RateLimiter أثناء مصافحة TCP/TLS حتى لا تتعثر التطبيقات عند الفتح
                 vpnService.protect(socket)
                 socket.tcpNoDelay = true
                 socket.soTimeout = 60000
@@ -543,8 +543,9 @@ class PacketForwarder(
                             writeToTunSafe(outputStream, rstPkt)
                             break
                         }
-                        // تطبيق سقف السرعة بدقة على بيانات التحميل فقط
-                        rateLimiter.acquire(read)
+                        try {
+                            rateLimiter.acquire(read)
+                        } catch (_: Exception) {}
                         totalDownloadedBytes += read
                         totalBytesTransferred.addAndGet(read.toLong())
                         val chunk = buffer.copyOf(read)
@@ -610,35 +611,6 @@ class PacketForwarder(
                 socket.close()
             } catch (_: Exception) {}
         }
-    }
-
-    private fun buildIcmpPortUnreachable(originalPacket: ByteArray, ipHeaderLen: Int): ByteArray? {
-        val quotedLen = (ipHeaderLen + 8).coerceAtMost(originalPacket.size)
-        if (quotedLen < 28) return null
-        val icmpLen = 8 + quotedLen
-        val totalLen = 20 + icmpLen
-        val buf = ByteBuffer.allocate(totalLen)
-
-        buf.put(0x45.toByte())
-        buf.put(0x00.toByte())
-        buf.putShort(totalLen.toShort())
-        buf.putShort(0)
-        buf.putShort(0x4000.toShort())
-        buf.put(64.toByte())
-        buf.put(1.toByte())
-        buf.putShort(0)
-        buf.put(originalPacket, 16, 4)
-        buf.put(originalPacket, 12, 4)
-        buf.putShort(10, computeChecksum(buf.array(), 0, 20))
-
-        buf.put(3.toByte())
-        buf.put(3.toByte())
-        buf.putShort(0)
-        buf.putInt(0)
-        buf.put(originalPacket, 0, quotedLen)
-        buf.putShort(22, computeChecksum(buf.array(), 20, icmpLen))
-
-        return buf.array()
     }
 
     private fun buildUdpIpPacket(srcIp: ByteArray, srcPort: Int, dstIp: ByteArray, dstPort: Int, payload: ByteArray): ByteArray {
