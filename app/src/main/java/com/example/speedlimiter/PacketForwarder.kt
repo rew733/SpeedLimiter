@@ -1,9 +1,6 @@
 package com.example.speedlimiter
 
-import android.net.ConnectivityManager
 import android.net.VpnService
-import android.os.Build
-import android.os.Process
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.DatagramPacket
@@ -21,9 +18,7 @@ import java.util.concurrent.atomic.AtomicLong
 class PacketForwarder(
     private val vpnService: VpnService,
     private val rateLimiter: RateLimiter,
-    private val maxSessionBytes: Long = Long.MAX_VALUE,
-    private val blockedUids: Set<Int> = emptySet(),
-    private val connectivityManager: ConnectivityManager? = null
+    private val maxSessionBytes: Long = Long.MAX_VALUE
 ) {
     private val executor = Executors.newCachedThreadPool()
     private val cleaner: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
@@ -91,25 +86,6 @@ class PacketForwarder(
         try { executor.shutdownNow() } catch (_: Exception) {}
     }
 
-    private fun isPacketFromBlockedApp(
-        protocol: Int,
-        srcIp: ByteArray,
-        srcPort: Int,
-        dstIp: ByteArray,
-        dstPort: Int
-    ): Boolean {
-        if (blockedUids.isEmpty() || connectivityManager == null) return false
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
-        return try {
-            val local = InetSocketAddress(InetAddress.getByAddress(srcIp), srcPort)
-            val remote = InetSocketAddress(InetAddress.getByAddress(dstIp), dstPort)
-            val uid = connectivityManager.getConnectionOwnerUid(protocol, local, remote)
-            uid != Process.INVALID_UID && blockedUids.contains(uid)
-        } catch (_: Exception) {
-            false
-        }
-    }
-
     private fun handleOutgoingPacket(rawPacket: ByteArray, outputStream: FileOutputStream) {
         if (rawPacket.size < 20) return
         val version = (rawPacket[0].toInt() shr 4) and 0x0F
@@ -137,10 +113,6 @@ class PacketForwarder(
         if (rawPacket.size < ipHeaderLen + 8) return
         val srcPort = ((rawPacket[ipHeaderLen].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 1].toInt() and 0xFF)
         val dstPort = ((rawPacket[ipHeaderLen + 2].toInt() and 0xFF) shl 8) or (rawPacket[ipHeaderLen + 3].toInt() and 0xFF)
-
-        if (isPacketFromBlockedApp(17, srcIp, srcPort, dstIp, dstPort)) {
-            return
-        }
 
         if (dstPort == 443) {
             val icmpUnreachable = buildIcmpPortUnreachable(rawPacket, ipHeaderLen)
@@ -264,24 +236,14 @@ class PacketForwarder(
         val fin = (flags and 0x01) != 0
         val rst = (flags and 0x04) != 0
 
-        val sessionKey = "${InetAddress.getByAddress(srcIp).hostAddress}:$srcPort-${InetAddress.getByAddress(dstIp).hostAddress}:$dstPort"
-
-        if (isPacketFromBlockedApp(6, srcIp, srcPort, dstIp, dstPort)) {
-            tcpSessions.remove(sessionKey)?.close()
-            if (!rst) {
-                val nextSeq = (seqNum + 1) and 0xFFFFFFFFL
-                val rstPkt = buildTcpIpPacket(dstIp, dstPort, srcIp, srcPort, 0L, nextSeq, 0x14, ByteArray(0))
-                writeToTunSafe(outputStream, rstPkt)
-            }
-            return
-        }
-
         val payloadOffset = ipHeaderLen + tcpHeaderLen
         val payload = if (rawPacket.size > payloadOffset) {
             rawPacket.copyOfRange(payloadOffset, rawPacket.size)
         } else {
             ByteArray(0)
         }
+
+        val sessionKey = "${InetAddress.getByAddress(srcIp).hostAddress}:$srcPort-${InetAddress.getByAddress(dstIp).hostAddress}:$dstPort"
 
         if (rst) {
             tcpSessions.remove(sessionKey)?.close()
