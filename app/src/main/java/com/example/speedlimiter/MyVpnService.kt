@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -50,7 +51,6 @@ class MyVpnService : VpnService() {
         val speedKbps = intent?.getLongExtra(EXTRA_SPEED_KBPS, 150L) ?: 150L
         val selectedPackages = intent?.getStringArrayListExtra(EXTRA_SELECTED_PACKAGES) ?: arrayListOf()
 
-        // تنظيف الجلسة السابقة فقط دون استدعاء stopSelf()
         isRunning = false
         closeAllResources()
 
@@ -87,7 +87,11 @@ class MyVpnService : VpnService() {
             .setOngoing(true)
             .build()
 
-        startForeground(NOTIFICATION_ID, notification)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
     }
 
     private fun stopForegroundCompat() {
@@ -155,7 +159,6 @@ class MyVpnService : VpnService() {
                 if (!isRunning) break
                 if (length <= 0) continue
 
-                rateLimiter.throttle(length)
                 handleIpv4Packet(buffer, length, output)
             }
         } catch (_: Exception) {
@@ -299,14 +302,16 @@ class MyVpnService : VpnService() {
                     socket.connect(InetSocketAddress(InetAddress.getByAddress(dstIp), dstPort), 5000)
                     tcpSockets[key] = socket
 
-                    val synAck = buildTcpControlPacket(
+                    val synAck = buildTcpPacket(
                         srcIp = dstIp,
                         srcPort = dstPort,
                         dstIp = srcIp,
                         dstPort = srcPort,
                         seq = 1000L,
                         ack = (seqNum + 1L) and 0xFFFFFFFFL,
-                        flags = 0x12
+                        flags = 0x12,
+                        payload = ByteArray(0),
+                        payloadLen = 0
                     )
                     synchronized(tunOut) {
                         if (isRunning) tunOut.write(synAck)
@@ -320,13 +325,14 @@ class MyVpnService : VpnService() {
                         if (readBytes <= 0) break
                         rateLimiter.throttle(readBytes)
 
-                        val dataPacket = buildTcpDataPacket(
+                        val dataPacket = buildTcpPacket(
                             srcIp = dstIp,
                             srcPort = dstPort,
                             dstIp = srcIp,
                             dstPort = srcPort,
                             seq = serverSeq,
                             ack = ackNum,
+                            flags = 0x18,
                             payload = buf,
                             payloadLen = readBytes
                         )
@@ -392,16 +398,19 @@ class MyVpnService : VpnService() {
         return out
     }
 
-    private fun buildTcpControlPacket(
+    private fun buildTcpPacket(
         srcIp: ByteArray,
         srcPort: Int,
         dstIp: ByteArray,
         dstPort: Int,
         seq: Long,
         ack: Long,
-        flags: Int
+        flags: Int,
+        payload: ByteArray,
+        payloadLen: Int
     ): ByteArray {
-        val totalLen = 40
+        val tcpLen = 20 + payloadLen
+        val totalLen = 20 + tcpLen
         val out = ByteArray(totalLen)
 
         out[0] = 0x45.toByte()
@@ -423,44 +432,43 @@ class MyVpnService : VpnService() {
         out[33] = (flags and 0xFF).toByte()
         out[34] = 0xFF.toByte()
         out[35] = 0xFF.toByte()
+
+        if (payloadLen > 0) {
+            System.arraycopy(payload, 0, out, 40, payloadLen)
+        }
+        writeTcpChecksum(out, srcIp, dstIp, tcpLen)
         return out
     }
 
-    private fun buildTcpDataPacket(
-        srcIp: ByteArray,
-        srcPort: Int,
-        dstIp: ByteArray,
-        dstPort: Int,
-        seq: Long,
-        ack: Long,
-        payload: ByteArray,
-        payloadLen: Int
-    ): ByteArray {
-        val totalLen = 40 + payloadLen
-        val out = ByteArray(totalLen)
+    private fun writeTcpChecksum(packet: ByteArray, srcIp: ByteArray, dstIp: ByteArray, tcpLen: Int) {
+        packet[36] = 0
+        packet[37] = 0
+        var sum = 0L
 
-        out[0] = 0x45.toByte()
-        out[2] = ((totalLen ushr 8) and 0xFF).toByte()
-        out[3] = (totalLen and 0xFF).toByte()
-        out[8] = 64
-        out[9] = 6
-        System.arraycopy(srcIp, 0, out, 12, 4)
-        System.arraycopy(dstIp, 0, out, 16, 4)
-        writeIpv4Checksum(out)
+        // Pseudo-header
+        for (i in 0..3 step 2) {
+            sum += ((srcIp[i].toInt() and 0xFF) shl 8) or (srcIp[i + 1].toInt() and 0xFF)
+            sum += ((dstIp[i].toInt() and 0xFF) shl 8) or (dstIp[i + 1].toInt() and 0xFF)
+        }
+        sum += 6L
+        sum += tcpLen.toLong()
 
-        out[20] = ((srcPort ushr 8) and 0xFF).toByte()
-        out[21] = (srcPort and 0xFF).toByte()
-        out[22] = ((dstPort ushr 8) and 0xFF).toByte()
-        out[23] = (dstPort and 0xFF).toByte()
-        writeUint32(out, 24, seq)
-        writeUint32(out, 28, ack)
-        out[32] = 0x50.toByte()
-        out[33] = 0x18.toByte()
-        out[34] = 0xFF.toByte()
-        out[35] = 0xFF.toByte()
+        var i = 20
+        val end = 20 + tcpLen
+        while (i + 1 < end) {
+            sum += ((packet[i].toInt() and 0xFF) shl 8) or (packet[i + 1].toInt() and 0xFF)
+            i += 2
+        }
+        if (i < end) {
+            sum += ((packet[i].toInt() and 0xFF) shl 8)
+        }
 
-        System.arraycopy(payload, 0, out, 40, payloadLen)
-        return out
+        while ((sum ushr 16) != 0L) {
+            sum = (sum and 0xFFFFL) + (sum ushr 16)
+        }
+        val checksum = sum.inv().toInt() and 0xFFFF
+        packet[36] = ((checksum ushr 8) and 0xFF).toByte()
+        packet[37] = (checksum and 0xFF).toByte()
     }
 
     private fun writeIpv4Checksum(header: ByteArray) {
